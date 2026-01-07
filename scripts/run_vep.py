@@ -25,15 +25,24 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional, Dict, List
 
 import numpy as np
 import pandas as pd
+
+# For REST API
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -172,6 +181,223 @@ vep -i {vcf_path} \\
     logger.info(f"      --vep-output {vcf_path.with_suffix('.vep.txt')} \\")
     logger.info(f"      --variants data/variants/pruned/variants_pruned.parquet \\")
     logger.info(f"      --output data/variants/pruned/variants_annotated.parquet")
+
+
+def run_vep_rest_api(args):
+    """Run VEP annotation using the Ensembl REST API in batches."""
+    if not HAS_REQUESTS:
+        logger.error("requests library required. Install with: pip install requests")
+        return
+
+    logger.info("=" * 50)
+    logger.info("VEP Annotation via REST API")
+    logger.info("=" * 50)
+
+    vcf_path = Path(args.vcf)
+    if not vcf_path.exists():
+        logger.error(f"VCF file not found: {vcf_path}")
+        return
+
+    output_path = Path(args.output) if args.output else vcf_path.with_suffix('.vep.json')
+
+    # Parse VCF to get variants
+    logger.info(f"Reading variants from {vcf_path}")
+    variants = parse_vcf_for_api(vcf_path)
+    logger.info(f"Found {len(variants):,} variants to annotate")
+
+    # VEP REST API settings
+    server = "https://rest.ensembl.org"
+    endpoint = "/vep/homo_sapiens/region"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    # Batch settings
+    batch_size = args.batch_size  # Max 200 per request
+    n_batches = (len(variants) + batch_size - 1) // batch_size
+
+    logger.info(f"Processing in {n_batches} batches of {batch_size} variants")
+    logger.info(f"Estimated time: {n_batches * 1.5 / 60:.1f} - {n_batches * 3 / 60:.1f} minutes")
+
+    all_results = []
+    failed_batches = []
+    start_time = time.time()
+
+    for batch_idx in range(n_batches):
+        start = batch_idx * batch_size
+        end = min(start + batch_size, len(variants))
+        batch_variants = variants[start:end]
+
+        # Prepare request payload
+        payload = {
+            "variants": batch_variants,
+            "canonical": 1,
+            "SIFT": "b",
+            "PolyPhen": "b",
+            "regulatory": 1,
+        }
+
+        # Retry logic with exponential backoff
+        max_retries = 4
+        for retry in range(max_retries):
+            try:
+                response = requests.post(
+                    server + endpoint,
+                    headers=headers,
+                    data=json.dumps(payload),
+                    timeout=60
+                )
+
+                if response.status_code == 200:
+                    results = response.json()
+                    all_results.extend(results)
+                    break
+                elif response.status_code == 429:  # Rate limited
+                    wait_time = 2 ** (retry + 1)
+                    logger.warning(f"Rate limited, waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.warning(f"Batch {batch_idx+1}: HTTP {response.status_code}")
+                    if retry < max_retries - 1:
+                        time.sleep(2 ** retry)
+                    else:
+                        failed_batches.append(batch_idx)
+            except requests.exceptions.Timeout:
+                logger.warning(f"Batch {batch_idx+1}: Timeout, retrying...")
+                if retry == max_retries - 1:
+                    failed_batches.append(batch_idx)
+            except Exception as e:
+                logger.warning(f"Batch {batch_idx+1}: Error {e}")
+                if retry == max_retries - 1:
+                    failed_batches.append(batch_idx)
+
+        # Rate limiting - be nice to the API
+        time.sleep(0.1)  # 10 requests per second max
+
+        # Progress update
+        if (batch_idx + 1) % 50 == 0 or batch_idx == n_batches - 1:
+            elapsed = time.time() - start_time
+            rate = (batch_idx + 1) / elapsed
+            remaining = (n_batches - batch_idx - 1) / rate if rate > 0 else 0
+            logger.info(
+                f"Processed {batch_idx+1}/{n_batches} batches "
+                f"({end:,}/{len(variants):,} variants) - "
+                f"ETA: {remaining/60:.1f} min"
+            )
+
+    elapsed_total = time.time() - start_time
+    logger.info(f"Completed in {elapsed_total/60:.1f} minutes")
+
+    if failed_batches:
+        logger.warning(f"Failed batches: {len(failed_batches)} (will have missing annotations)")
+
+    # Save raw JSON results
+    logger.info(f"Saving {len(all_results):,} annotations to {output_path}")
+    with open(output_path, 'w') as f:
+        json.dump(all_results, f)
+
+    # Also convert to tab-delimited format for easier parsing
+    txt_path = output_path.with_suffix('.vep.txt')
+    convert_json_to_tabular(all_results, txt_path)
+
+    logger.info("=" * 50)
+    logger.info("VEP ANNOTATION COMPLETE")
+    logger.info("=" * 50)
+    logger.info(f"JSON output: {output_path}")
+    logger.info(f"Tabular output: {txt_path}")
+    logger.info("")
+    logger.info("Next step - parse and merge with variants:")
+    logger.info(f"  python scripts/run_vep.py parse \\")
+    logger.info(f"      --vep-output {txt_path} \\")
+    logger.info(f"      --variants data/variants/pruned/variants_pruned.parquet \\")
+    logger.info(f"      --output data/variants/pruned/variants_annotated.parquet")
+
+
+def parse_vcf_for_api(vcf_path: Path) -> List[str]:
+    """Parse VCF file and convert to VEP REST API format."""
+    variants = []
+
+    with open(vcf_path, 'r') as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+
+            parts = line.strip().split('\t')
+            if len(parts) < 5:
+                continue
+
+            chrom = parts[0].replace('chr', '')
+            pos = parts[1]
+            ref = parts[3]
+            alt = parts[4]
+
+            # Handle multiple alts
+            for a in alt.split(','):
+                # Format: "chr pos ref alt"
+                # For SNPs: "6 26092913 A G"
+                # For indels: "6 26092913 AT A"
+                variant_str = f"{chrom} {pos} {ref} {a}"
+                variants.append(variant_str)
+
+    return variants
+
+
+def convert_json_to_tabular(results: List[Dict], output_path: Path):
+    """Convert VEP JSON results to tab-delimited format."""
+    rows = []
+
+    for result in results:
+        input_var = result.get('input', '')
+
+        # Get most severe consequence
+        most_severe = result.get('most_severe_consequence', '')
+
+        # Get transcript consequences
+        transcript_consequences = result.get('transcript_consequences', [])
+
+        if transcript_consequences:
+            for tc in transcript_consequences:
+                row = {
+                    'Uploaded_variation': input_var,
+                    'Location': f"{result.get('seq_region_name', '')}:{result.get('start', '')}",
+                    'Allele': result.get('allele_string', '').split('/')[-1] if '/' in result.get('allele_string', '') else '',
+                    'Gene': tc.get('gene_id', ''),
+                    'Feature': tc.get('transcript_id', ''),
+                    'Feature_type': 'Transcript',
+                    'Consequence': ','.join(tc.get('consequence_terms', [])),
+                    'IMPACT': tc.get('impact', ''),
+                    'SYMBOL': tc.get('gene_symbol', ''),
+                    'SIFT': f"{tc.get('sift_prediction', '')}({tc.get('sift_score', '')})" if tc.get('sift_prediction') else '',
+                    'PolyPhen': f"{tc.get('polyphen_prediction', '')}({tc.get('polyphen_score', '')})" if tc.get('polyphen_prediction') else '',
+                    'CANONICAL': 'YES' if tc.get('canonical') else '',
+                    'Amino_acids': tc.get('amino_acids', ''),
+                    'Codons': tc.get('codons', ''),
+                    'Protein_position': tc.get('protein_start', ''),
+                }
+                rows.append(row)
+        else:
+            # No transcript consequences - intergenic or regulatory
+            row = {
+                'Uploaded_variation': input_var,
+                'Location': f"{result.get('seq_region_name', '')}:{result.get('start', '')}",
+                'Allele': result.get('allele_string', '').split('/')[-1] if '/' in result.get('allele_string', '') else '',
+                'Gene': '',
+                'Feature': '',
+                'Feature_type': '',
+                'Consequence': most_severe,
+                'IMPACT': '',
+                'SYMBOL': '',
+                'SIFT': '',
+                'PolyPhen': '',
+                'CANONICAL': '',
+                'Amino_acids': '',
+                'Codons': '',
+                'Protein_position': '',
+            }
+            rows.append(row)
+
+    # Write to file
+    df = pd.DataFrame(rows)
+    df.to_csv(output_path, sep='\t', index=False)
+    logger.info(f"Wrote {len(rows):,} annotation rows to {output_path}")
 
 
 def parse_vep_output(args):
@@ -530,12 +756,32 @@ def main():
         help='VEP cache directory'
     )
 
+    # REST API subcommand (recommended for ~100K variants)
+    api_parser = subparsers.add_parser(
+        'rest-api',
+        help='Run VEP via Ensembl REST API (recommended for ~100K variants)'
+    )
+    api_parser.add_argument(
+        '--vcf', required=True,
+        help='Path to VCF file (from convert-vcf step)'
+    )
+    api_parser.add_argument(
+        '--output', '-o',
+        help='Output file path (default: input.vep.json)'
+    )
+    api_parser.add_argument(
+        '--batch-size', type=int, default=200,
+        help='Variants per API request (default: 200, max: 200)'
+    )
+
     args = parser.parse_args()
 
     if args.command == 'convert-vcf':
         convert_bed_to_vcf(args)
     elif args.command == 'parse':
         parse_vep_output(args)
+    elif args.command == 'rest-api':
+        run_vep_rest_api(args)
     elif args.command == 'run':
         logger.error("Full pipeline not yet implemented. Please use convert-vcf and parse separately.")
         logger.info("See instructions with: python scripts/run_vep.py convert-vcf --help")
