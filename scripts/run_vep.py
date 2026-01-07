@@ -312,7 +312,13 @@ def run_vep_rest_api(args):
 
 
 def parse_vcf_for_api(vcf_path: Path) -> List[str]:
-    """Parse VCF file and convert to VEP REST API format."""
+    """Parse VCF file and convert to VEP REST API format.
+
+    VEP REST API expects format: "chr start end allele_string strand"
+    Example: "6 26092913 26092913 A/G 1"
+    For insertions: "6 26092913 26092912 -/G 1" (end = start - 1)
+    For deletions: "6 26092913 26092914 AG/- 1"
+    """
     variants = []
 
     with open(vcf_path, 'r') as f:
@@ -325,16 +331,35 @@ def parse_vcf_for_api(vcf_path: Path) -> List[str]:
                 continue
 
             chrom = parts[0].replace('chr', '')
-            pos = parts[1]
+            pos = int(parts[1])
             ref = parts[3]
             alt = parts[4]
 
             # Handle multiple alts
             for a in alt.split(','):
-                # Format: "chr pos ref alt"
-                # For SNPs: "6 26092913 A G"
-                # For indels: "6 26092913 AT A"
-                variant_str = f"{chrom} {pos} {ref} {a}"
+                # Determine start/end positions based on variant type
+                ref_len = len(ref)
+                alt_len = len(a)
+
+                if ref_len == 1 and alt_len == 1:
+                    # SNP: start == end
+                    start = pos
+                    end = pos
+                    allele_string = f"{ref}/{a}"
+                elif ref_len > alt_len:
+                    # Deletion
+                    start = pos
+                    end = pos + ref_len - 1
+                    allele_string = f"{ref}/{a}"
+                else:
+                    # Insertion
+                    start = pos
+                    end = pos + ref_len - 1
+                    allele_string = f"{ref}/{a}"
+
+                # Format: "chr start end allele_string strand"
+                # Strand 1 = forward
+                variant_str = f"{chrom} {start} {end} {allele_string} 1"
                 variants.append(variant_str)
 
     return variants
