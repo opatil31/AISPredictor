@@ -342,14 +342,14 @@ def generate_embeddings(args):
         np.save(output_path.with_suffix('.diff.npy'), diff_embeddings)
         logger.info(f"Saved difference embeddings to {output_path.with_suffix('.diff.npy')}")
 
-    # Save metadata
+    # Save metadata (convert numpy types to Python native for JSON serialization)
     metadata = {
         'model_name': args.model_name,
-        'embedding_dim': embedding_dim,
-        'max_length': max_length,
+        'embedding_dim': int(embedding_dim),
+        'max_length': int(max_length),
         'pooling': args.pooling,
-        'n_variants': len(df),
-        'n_valid': n_valid,
+        'n_variants': int(len(df)),
+        'n_valid': int(n_valid),
     }
 
     import json
