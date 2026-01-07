@@ -760,14 +760,37 @@ def train_model(args):
         count = (region_types == i).sum()
         logger.info(f"  {rtype}: {count:,} ({100*count/len(region_types):.1f}%)")
 
-    # Load dosages
+    # Load dosages (supports both parquet and zarr formats)
     logger.info(f"Loading dosages from {args.dosages}")
-    dosages_df = pd.read_parquet(args.dosages)
+    dosages_path = Path(args.dosages)
 
-    variant_cols = ['SNP', 'CHR', 'POS', 'A1', 'A2', 'REF', 'ALT', 'variant_id']
-    sample_cols = [c for c in dosages_df.columns if c not in variant_cols]
-    dosages = dosages_df[sample_cols].values.T  # (n_samples, n_variants)
-    sample_ids = sample_cols
+    if str(dosages_path).endswith('.zarr') or (dosages_path.is_dir() and (dosages_path / '.zarray').exists()):
+        # Zarr format: (n_samples, n_variants) array
+        try:
+            import zarr
+            dosages = np.array(zarr.open(str(dosages_path), mode='r'))
+            logger.info(f"Loaded zarr dosages: {dosages.shape}")
+
+            # Try to load sample IDs from accompanying file
+            sample_ids_path = dosages_path.parent / 'sample_ids.txt'
+            if not sample_ids_path.exists():
+                sample_ids_path = dosages_path.with_suffix('.sample_ids.txt')
+            if sample_ids_path.exists():
+                with open(sample_ids_path, 'r') as f:
+                    sample_ids = [line.strip() for line in f if line.strip()]
+                logger.info(f"Loaded {len(sample_ids)} sample IDs")
+            else:
+                sample_ids = [f"sample_{i}" for i in range(dosages.shape[0])]
+                logger.warning(f"No sample_ids.txt found, using generic IDs")
+        except ImportError:
+            raise ImportError("zarr required for .zarr dosages. Install with: pip install zarr")
+    else:
+        # Parquet format: rows=variants, columns=samples
+        dosages_df = pd.read_parquet(args.dosages)
+        variant_cols = ['SNP', 'CHR', 'POS', 'A1', 'A2', 'REF', 'ALT', 'variant_id']
+        sample_cols = [c for c in dosages_df.columns if c not in variant_cols]
+        dosages = dosages_df[sample_cols].values.T  # (n_samples, n_variants)
+        sample_ids = sample_cols
 
     logger.info(f"Dosages shape: {dosages.shape}")
 
