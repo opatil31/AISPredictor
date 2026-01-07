@@ -128,9 +128,9 @@ def find_plink2() -> str:
 
 
 def run_plink2(plink2_path: str, pfile: str, keep_file: str, output_prefix: str,
-               maf: float = 0.01, hwe_p: float = 1e-6) -> bool:
+               maf: float = 0.01, hwe_p: float = 1e-6, export_format: str = 'bed') -> bool:
     """
-    Run PLINK2 to filter variants and export dosages.
+    Run PLINK2 to filter variants and export.
 
     Args:
         plink2_path: Path to plink2 executable
@@ -139,20 +139,35 @@ def run_plink2(plink2_path: str, pfile: str, keep_file: str, output_prefix: str,
         output_prefix: Output file prefix
         maf: Minimum minor allele frequency
         hwe_p: Minimum HWE p-value
+        export_format: 'bed' for binary (fast) or 'raw' for text (slow)
 
     Returns:
         True if successful
     """
-    cmd = [
-        plink2_path,
-        '--pfile', pfile,
-        '--keep', keep_file,
-        '--maf', str(maf),
-        '--snps-only',
-        '--hwe', str(hwe_p),
-        '--export', 'A',
-        '--out', output_prefix
-    ]
+    if export_format == 'bed':
+        # Binary format - much faster and smaller
+        cmd = [
+            plink2_path,
+            '--pfile', pfile,
+            '--keep', keep_file,
+            '--maf', str(maf),
+            '--snps-only',
+            '--hwe', str(hwe_p),
+            '--make-bed',
+            '--out', output_prefix
+        ]
+    else:
+        # Text format (legacy)
+        cmd = [
+            plink2_path,
+            '--pfile', pfile,
+            '--keep', keep_file,
+            '--maf', str(maf),
+            '--snps-only',
+            '--hwe', str(hwe_p),
+            '--export', 'A',
+            '--out', output_prefix
+        ]
 
     logger.info(f"Running PLINK2 command:")
     logger.info(f"  {' '.join(cmd)}")
@@ -181,6 +196,183 @@ def run_plink2(plink2_path: str, pfile: str, keep_file: str, output_prefix: str,
     except FileNotFoundError:
         logger.error(f"PLINK2 executable not found at: {plink2_path}")
         return False
+
+
+def convert_bed(args):
+    """Convert PLINK1 binary format (.bed/.bim/.fam) to project format - FAST!"""
+    bed_prefix = Path(args.bed)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    bed_path = bed_prefix.with_suffix('.bed')
+    bim_path = bed_prefix.with_suffix('.bim')
+    fam_path = bed_prefix.with_suffix('.fam')
+
+    logger.info(f"Loading PLINK binary files from {bed_prefix}")
+
+    # Check files exist
+    for p in [bed_path, bim_path, fam_path]:
+        if not p.exists():
+            logger.error(f"File not found: {p}")
+            return
+
+    # Read .bim (variant info): chr, id, cm, pos, a1, a2
+    logger.info("Reading variant info (.bim)...")
+    bim_df = pd.read_csv(bim_path, sep='\t', header=None,
+                         names=['CHR', 'ID', 'CM', 'POS', 'A1', 'A2'])
+    n_variants = len(bim_df)
+    logger.info(f"Found {n_variants:,} variants")
+
+    # Read .fam (sample info): fid, iid, father, mother, sex, pheno
+    logger.info("Reading sample info (.fam)...")
+    fam_df = pd.read_csv(fam_path, sep=r'\s+', header=None,
+                         names=['FID', 'IID', 'FATHER', 'MOTHER', 'SEX', 'PHENO'])
+    n_samples = len(fam_df)
+    sample_ids = fam_df['IID'].astype(str).tolist()
+    logger.info(f"Found {n_samples:,} samples")
+
+    # Read .bed (genotype data) - binary format
+    logger.info("Reading genotype data (.bed)...")
+
+    # .bed file format:
+    # - First 3 bytes: magic number (0x6c, 0x1b, 0x01 for SNP-major)
+    # - Then: ceil(n_samples/4) bytes per variant
+    # - Each byte encodes 4 samples (2 bits each): 00=hom_a1, 01=het, 10=missing, 11=hom_a2
+
+    bytes_per_variant = (n_samples + 3) // 4
+
+    with open(bed_path, 'rb') as f:
+        # Check magic number
+        magic = f.read(3)
+        if magic != b'\x6c\x1b\x01':
+            logger.error(f"Invalid .bed file format (not SNP-major)")
+            return
+
+        # Initialize dosage array
+        try:
+            import zarr
+            zarr_path = output_dir / "dosages.zarr"
+            dosages = zarr.open(
+                str(zarr_path),
+                mode='w',
+                shape=(n_samples, n_variants),
+                chunks=(min(500, n_samples), min(50000, n_variants)),
+                dtype='float32'
+            )
+        except ImportError:
+            logger.info("zarr not available, using numpy array (may use more memory)")
+            dosages = np.zeros((n_samples, n_variants), dtype=np.float32)
+            zarr_path = None
+
+        # Decode table: 2-bit encoding -> dosage (count of A1 allele)
+        # 00 -> 2 (hom A1), 01 -> 1 (het), 10 -> NaN (missing), 11 -> 0 (hom A2)
+        decode_table = np.array([2, 1, np.nan, 0], dtype=np.float32)
+
+        # Process in batches of variants for efficiency
+        BATCH_SIZE = 10000
+        n_batches = (n_variants + BATCH_SIZE - 1) // BATCH_SIZE
+
+        logger.info(f"Processing {n_batches} batches of {BATCH_SIZE} variants (vectorized)...")
+
+        # Precompute number of samples rounded up to multiple of 4
+        n_samples_padded = bytes_per_variant * 4
+
+        for batch_idx in range(n_batches):
+            start_var = batch_idx * BATCH_SIZE
+            end_var = min(start_var + BATCH_SIZE, n_variants)
+            batch_n_vars = end_var - start_var
+
+            # Read bytes for this batch
+            batch_bytes = np.frombuffer(f.read(bytes_per_variant * batch_n_vars), dtype=np.uint8)
+            batch_bytes = batch_bytes.reshape(batch_n_vars, bytes_per_variant)
+
+            # VECTORIZED decoding - extract all 4 genotypes from each byte using bitwise ops
+            # Each byte encodes 4 samples (2 bits each)
+            geno_0 = batch_bytes & 0x03          # bits 0-1
+            geno_1 = (batch_bytes >> 2) & 0x03   # bits 2-3
+            geno_2 = (batch_bytes >> 4) & 0x03   # bits 4-5
+            geno_3 = (batch_bytes >> 6) & 0x03   # bits 6-7
+
+            # Interleave to get proper sample order: shape (n_vars, bytes_per_var, 4)
+            geno_interleaved = np.stack([geno_0, geno_1, geno_2, geno_3], axis=-1)
+            # Reshape to (n_vars, n_samples_padded)
+            geno_codes = geno_interleaved.reshape(batch_n_vars, n_samples_padded)
+            # Trim to actual number of samples and transpose to (n_samples, n_vars)
+            geno_codes = geno_codes[:, :n_samples].T
+
+            # Convert genotype codes to dosages using lookup table
+            batch_dosages = decode_table[geno_codes]
+
+            # Write to output
+            dosages[:, start_var:end_var] = batch_dosages
+
+            if (batch_idx + 1) % 5 == 0 or batch_idx == n_batches - 1:
+                logger.info(f"Processed {end_var:,}/{n_variants:,} variants ({100*end_var/n_variants:.1f}%)")
+
+    logger.info(f"Loaded dosage matrix: {n_samples} x {n_variants}")
+
+    # Save outputs
+    logger.info("Saving outputs...")
+
+    # Variant info
+    bim_df['variant_idx'] = np.arange(len(bim_df))
+    # Calculate MAF
+    if zarr_path:
+        # Sample for MAF calculation
+        sample_dosages = dosages[:min(1000, n_samples), :]
+        af = np.nanmean(sample_dosages, axis=0) / 2
+    else:
+        af = np.nanmean(dosages, axis=0) / 2
+    maf = np.minimum(af, 1 - af)
+    bim_df['AF'] = af
+    bim_df['MAF'] = maf
+
+    variants_path = output_dir / "variants.parquet"
+    bim_df.to_parquet(variants_path, index=False)
+    logger.info(f"Saved {n_variants:,} variants to {variants_path}")
+
+    # Sample IDs
+    sample_path = output_dir / "sample_ids.txt"
+    with open(sample_path, 'w') as f:
+        for sid in sample_ids:
+            f.write(f"{sid}\n")
+    logger.info(f"Saved {n_samples:,} sample IDs to {sample_path}")
+
+    # If we used numpy array, save as zarr now
+    if zarr_path is None:
+        try:
+            import zarr
+            zarr_path = output_dir / "dosages.zarr"
+            zarr_array = zarr.open(
+                str(zarr_path), mode='w',
+                shape=dosages.shape,
+                chunks=(min(500, n_samples), min(50000, n_variants)),
+                dtype='float32'
+            )
+            zarr_array[:] = dosages
+            logger.info(f"Saved dosages to {zarr_path}")
+        except ImportError:
+            npy_path = output_dir / "dosages.npy"
+            np.save(npy_path, dosages)
+            logger.info(f"Saved dosages to {npy_path}")
+    else:
+        logger.info(f"Dosages already saved to {zarr_path}")
+
+    # QC report
+    report_path = output_dir / "qc_report.txt"
+    with open(report_path, 'w') as f:
+        f.write("Variant Extraction Report (PLINK binary method)\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Samples: {n_samples}\n")
+        f.write(f"Variants: {n_variants}\n\n")
+        f.write(f"MAF range: {np.nanmin(maf):.4f} - {np.nanmax(maf):.4f}\n")
+
+    logger.info("=" * 50)
+    logger.info("VARIANT EXTRACTION COMPLETE")
+    logger.info("=" * 50)
+    logger.info(f"Samples: {n_samples:,}")
+    logger.info(f"Variants: {n_variants:,}")
+    logger.info(f"Output directory: {output_dir}")
 
 
 def prepare_ids(args):
@@ -460,6 +652,10 @@ def run_full_pipeline(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Determine export format - binary is MUCH faster (default)
+    use_text_format = getattr(args, 'use_text_format', False)
+    export_format = 'raw' if use_text_format else 'bed'
+
     # Step 1: Find PLINK2
     logger.info("=" * 50)
     logger.info("STEP 1: Finding PLINK2")
@@ -497,7 +693,7 @@ def run_full_pipeline(args):
     # Step 3: Run PLINK2
     logger.info("")
     logger.info("=" * 50)
-    logger.info("STEP 3: Running PLINK2 QC and export")
+    logger.info(f"STEP 3: Running PLINK2 QC and export (format: {export_format})")
     logger.info("=" * 50)
 
     output_prefix = str(output_dir / "chr6_filtered")
@@ -508,7 +704,8 @@ def run_full_pipeline(args):
         keep_file=str(ids_path),
         output_prefix=output_prefix,
         maf=args.maf_min,
-        hwe_p=args.hwe_p_min
+        hwe_p=args.hwe_p_min,
+        export_format=export_format
     )
 
     if not success:
@@ -521,25 +718,34 @@ def run_full_pipeline(args):
     logger.info("STEP 4: Converting to project format")
     logger.info("=" * 50)
 
-    raw_path = Path(f"{output_prefix}.raw")
-    if not raw_path.exists():
-        logger.error(f"Expected output file not found: {raw_path}")
-        return
-
     # Create args-like object for convert function
     class ConvertArgs:
         pass
 
     convert_args = ConvertArgs()
-    convert_args.raw = str(raw_path)
     convert_args.output_dir = str(output_dir)
-    convert_args.chunked = args.chunked
-    convert_args.chunk_size = args.chunk_size
 
-    if args.chunked:
-        convert_raw_chunked(convert_args)
+    if export_format == 'bed':
+        # Binary format - FAST
+        bed_path = Path(f"{output_prefix}.bed")
+        if not bed_path.exists():
+            logger.error(f"Expected output file not found: {bed_path}")
+            return
+        convert_args.bed = output_prefix
+        convert_bed(convert_args)
     else:
-        convert_raw(convert_args)
+        # Text format - slow (legacy)
+        raw_path = Path(f"{output_prefix}.raw")
+        if not raw_path.exists():
+            logger.error(f"Expected output file not found: {raw_path}")
+            return
+        convert_args.raw = str(raw_path)
+        convert_args.chunked = getattr(args, 'chunked', False)
+        convert_args.chunk_size = getattr(args, 'chunk_size', 1000)
+        if convert_args.chunked:
+            convert_raw_chunked(convert_args)
+        else:
+            convert_raw(convert_args)
 
     logger.info("")
     logger.info("=" * 50)
@@ -592,13 +798,19 @@ def main():
     run_parser.add_argument(
         '--chunked',
         action='store_true',
-        help='Use chunked reading for large files'
+        help='Use chunked reading for large files (only for text format)'
     )
     run_parser.add_argument(
         '--chunk-size',
         type=int,
         default=1000,
-        help='Samples per chunk (default: 1000)'
+        help='Samples per chunk for text format (default: 1000)'
+    )
+    run_parser.add_argument(
+        '--use-text-format',
+        action='store_true',
+        dest='use_text_format',
+        help='Use slow text format (.raw) instead of fast binary format (.bed)'
     )
 
     # prepare-ids subcommand (for manual workflow)
@@ -642,6 +854,22 @@ def main():
         type=int,
         default=1000,
         help='Samples per chunk (default: 1000)'
+    )
+
+    # convert-bed subcommand (for binary format - FAST)
+    bed_parser = subparsers.add_parser(
+        'convert-bed',
+        help='Convert PLINK binary (.bed/.bim/.fam) to project format - FAST!'
+    )
+    bed_parser.add_argument(
+        '--bed',
+        required=True,
+        help='Path prefix to PLINK binary files (e.g., /path/to/chr6 for chr6.bed/bim/fam)'
+    )
+    bed_parser.add_argument(
+        '--output-dir',
+        default='data/variants',
+        help='Output directory'
     )
 
     # Also allow running without subcommand (same as 'run')
@@ -698,14 +926,22 @@ def main():
             convert_raw_chunked(args)
         else:
             convert_raw(args)
+    elif args.command == 'convert-bed':
+        convert_bed(args)
     elif args.pfile and args.cohort:
         # No subcommand but --pfile and --cohort provided: run full pipeline
         run_full_pipeline(args)
     else:
         parser.print_help()
         print("\nExamples:")
+        print("  # Full pipeline (uses fast binary format by default):")
         print("  python scripts/extract_variants_plink2.py --pfile /path/to/chr6 --cohort data/cohort/cohort.parquet")
-        print("  python scripts/extract_variants_plink2.py run --pfile /path/to/chr6 --cohort data/cohort/cohort.parquet")
+        print("")
+        print("  # Convert existing PLINK binary files directly:")
+        print("  python scripts/extract_variants_plink2.py convert-bed --bed /path/to/chr6_filtered")
+        print("")
+        print("  # Use slower text format (not recommended):")
+        print("  python scripts/extract_variants_plink2.py run --pfile /path/to/chr6 --cohort data/cohort/cohort.parquet --use-text-format")
 
 
 if __name__ == "__main__":
