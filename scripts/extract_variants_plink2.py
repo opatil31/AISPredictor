@@ -374,35 +374,31 @@ def convert_raw_chunked(args):
         logger.error("zarr is required for chunked mode. Install with: pip install zarr")
         return
 
-    # Read line by line (much faster than pandas for wide files)
+    # Read line by line with numpy optimization (much faster)
     sample_ids = []
 
-    logger.info(f"Reading {n_samples} samples line by line...")
+    logger.info(f"Reading {n_samples} samples with numpy optimization...")
 
     with open(raw_path, 'r') as f:
         # Skip header
         f.readline()
 
         for i, line in enumerate(f):
-            # Split line
-            parts = line.strip().split()
+            # Split only first 6 fields to get metadata, keep rest as one string
+            parts = line.split(maxsplit=6)
 
             # First 6 columns are metadata: FID IID PAT MAT SEX PHENOTYPE
             sample_ids.append(parts[1])  # IID
 
-            # Remaining columns are dosages
-            dosages = []
-            for val in parts[6:]:
-                if val == 'NA':
-                    dosages.append(np.nan)
-                else:
-                    dosages.append(float(val))
+            # Parse dosages using numpy (much faster than Python loop)
+            dosage_str = parts[6].replace('NA', 'nan')
+            dosages = np.fromstring(dosage_str, sep=' ', dtype=np.float32)
 
             # Write to zarr
-            zarr_array[i, :] = np.array(dosages, dtype=np.float32)
+            zarr_array[i, :] = dosages
 
-            # Progress every 100 samples
-            if (i + 1) % 100 == 0:
+            # Progress every 500 samples
+            if (i + 1) % 500 == 0:
                 logger.info(f"Processed {i + 1:,}/{n_samples:,} samples ({100*(i+1)/n_samples:.1f}%)")
 
     logger.info(f"Loaded {len(sample_ids)} samples")
