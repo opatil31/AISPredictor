@@ -124,15 +124,15 @@ def run_plink2_ld_prune(
 
     logger.info(f"Retained {len(pruned_variants):,} variants after LD pruning")
 
-    # Step 2: Export pruned dosages
-    logger.info("Step 2: Exporting pruned dosages...")
+    # Step 2: Export pruned dosages in binary format (FAST)
+    logger.info("Step 2: Exporting pruned genotypes (binary format)...")
 
     export_cmd = [
         plink2_path,
         '--pfile', pfile,
         '--keep', keep_file,
         '--extract', str(prune_in_file),
-        '--export', 'A',
+        '--make-bed',
         '--out', f"{output_prefix}_pruned"
     ]
 
@@ -392,28 +392,26 @@ def prune_with_plink2(args):
         logger.error("LD pruning failed")
         return
 
-    # Convert pruned .raw to project format
-    raw_path = Path(f"{output_prefix}_pruned.raw")
-    if not raw_path.exists():
-        logger.error(f"Pruned .raw file not found: {raw_path}")
+    # Convert pruned .bed to project format (FAST binary conversion)
+    bed_path = Path(f"{output_prefix}_pruned.bed")
+    if not bed_path.exists():
+        logger.error(f"Pruned .bed file not found: {bed_path}")
         return
 
-    logger.info("Converting pruned data to project format...")
+    logger.info("Converting pruned data to project format (binary)...")
 
     # Use the convert function from extract_variants_plink2
     sys.path.insert(0, str(Path(__file__).parent))
-    from extract_variants_plink2 import convert_raw_chunked
+    from extract_variants_plink2 import convert_bed
 
     class ConvertArgs:
         pass
 
     convert_args = ConvertArgs()
-    convert_args.raw = str(raw_path)
+    convert_args.bed = f"{output_prefix}_pruned"
     convert_args.output_dir = str(output_dir)
-    convert_args.chunked = True
-    convert_args.chunk_size = 1000
 
-    convert_raw_chunked(convert_args)
+    convert_bed(convert_args)
 
     # Rename output files to indicate they're pruned
     for old_name, new_name in [
@@ -442,6 +440,145 @@ def prune_with_plink2(args):
 
     logger.info("=" * 50)
     logger.info("LD PRUNING COMPLETE")
+    logger.info("=" * 50)
+
+
+def prune_from_bed(args):
+    """Run LD pruning on existing PLINK1 binary (.bed) files."""
+    logger.info("=" * 50)
+    logger.info("LD Pruning from .bed files (PLINK2 method)")
+    logger.info("=" * 50)
+
+    # Find PLINK2
+    if args.plink2_path:
+        plink2_path = args.plink2_path
+    else:
+        plink2_path = find_plink2()
+        if not plink2_path:
+            logger.error("PLINK2 not found. Please specify --plink2-path or add to PATH.")
+            return
+
+    logger.info(f"Using PLINK2: {plink2_path}")
+
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check input files exist
+    bed_prefix = Path(args.bfile)
+    for ext in ['.bed', '.bim', '.fam']:
+        if not bed_prefix.with_suffix(ext).exists():
+            # Try without suffix
+            test_path = Path(str(bed_prefix) + ext)
+            if not test_path.exists():
+                logger.error(f"File not found: {bed_prefix}{ext}")
+                return
+
+    # Step 1: Run LD pruning
+    logger.info("Step 1: Running PLINK2 LD pruning...")
+    output_prefix = str(output_dir / "chr6")
+
+    prune_cmd = [
+        plink2_path,
+        '--bfile', str(bed_prefix),
+        '--indep-pairwise', str(args.window_kb), 'kb', str(args.step), str(args.r2_threshold),
+        '--out', output_prefix
+    ]
+
+    logger.info(f"Command: {' '.join(prune_cmd)}")
+
+    try:
+        result = subprocess.run(prune_cmd, capture_output=True, text=True, check=True)
+        logger.info("LD pruning completed successfully")
+        # Print relevant output
+        for line in result.stdout.split('\n')[-15:]:
+            if line.strip():
+                logger.info(f"  {line}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"PLINK2 LD pruning failed: {e.stderr}")
+        return
+
+    # Read pruned variant list
+    prune_in_file = Path(f"{output_prefix}.prune.in")
+    if not prune_in_file.exists():
+        logger.error(f"Pruned variant file not found: {prune_in_file}")
+        return
+
+    with open(prune_in_file, 'r') as f:
+        pruned_variants = [line.strip() for line in f if line.strip()]
+
+    logger.info(f"Retained {len(pruned_variants):,} variants after LD pruning")
+
+    # Step 2: Extract pruned variants to new .bed file
+    logger.info("Step 2: Extracting pruned variants (binary format)...")
+
+    extract_cmd = [
+        plink2_path,
+        '--bfile', str(bed_prefix),
+        '--extract', str(prune_in_file),
+        '--make-bed',
+        '--out', f"{output_prefix}_pruned"
+    ]
+
+    logger.info(f"Command: {' '.join(extract_cmd)}")
+
+    try:
+        result = subprocess.run(extract_cmd, capture_output=True, text=True, check=True)
+        logger.info("Extraction completed successfully")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"PLINK2 extraction failed: {e.stderr}")
+        return
+
+    # Step 3: Convert to project format
+    bed_path = Path(f"{output_prefix}_pruned.bed")
+    if not bed_path.exists():
+        logger.error(f"Pruned .bed file not found: {bed_path}")
+        return
+
+    logger.info("Step 3: Converting to project format...")
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from extract_variants_plink2 import convert_bed
+
+    class ConvertArgs:
+        pass
+
+    convert_args = ConvertArgs()
+    convert_args.bed = f"{output_prefix}_pruned"
+    convert_args.output_dir = str(output_dir)
+
+    convert_bed(convert_args)
+
+    # Rename output files
+    for old_name, new_name in [
+        ("variants.parquet", "variants_pruned.parquet"),
+        ("dosages.zarr", "dosages_pruned.zarr"),
+        ("sample_ids.txt", "sample_ids_pruned.txt"),
+    ]:
+        old_path = output_dir / old_name
+        new_path = output_dir / new_name
+        if old_path.exists():
+            if new_path.exists():
+                shutil.rmtree(new_path) if new_path.is_dir() else new_path.unlink()
+            old_path.rename(new_path)
+
+    # Save pruning report
+    report_path = output_dir / "ld_prune_report.txt"
+    with open(report_path, 'w') as f:
+        f.write("LD Pruning Report\n")
+        f.write("=" * 50 + "\n\n")
+        f.write(f"Method: PLINK2 (from .bed)\n")
+        f.write(f"Input: {bed_prefix}\n")
+        f.write(f"Window size: {args.window_kb} kb\n")
+        f.write(f"Step: {args.step} variant(s)\n")
+        f.write(f"r² threshold: {args.r2_threshold}\n\n")
+        f.write(f"Variants retained: {len(pruned_variants):,}\n")
+    logger.info(f"Saved report to {report_path}")
+
+    logger.info("=" * 50)
+    logger.info("LD PRUNING COMPLETE")
+    logger.info(f"Output: {output_dir}")
+    logger.info(f"Pruned variants: {len(pruned_variants):,}")
     logger.info("=" * 50)
 
 
@@ -493,10 +630,40 @@ def main():
         help='Minimum HWE p-value (default: 1e-6)'
     )
 
+    # From existing .bed files (RECOMMENDED for already-extracted data)
+    bed_parser = subparsers.add_parser(
+        'from-bed',
+        help='LD prune from existing .bed files (recommended if you already extracted variants)'
+    )
+    bed_parser.add_argument(
+        '--bfile', required=True,
+        help='PLINK1 binary file prefix (e.g., data/variants/chr6_filtered)'
+    )
+    bed_parser.add_argument(
+        '--output-dir', default='data/variants/pruned',
+        help='Output directory'
+    )
+    bed_parser.add_argument(
+        '--plink2-path',
+        help='Path to PLINK2 executable'
+    )
+    bed_parser.add_argument(
+        '--window-kb', type=int, default=DEFAULT_WINDOW_KB,
+        help=f'LD window size in kb (default: {DEFAULT_WINDOW_KB})'
+    )
+    bed_parser.add_argument(
+        '--step', type=int, default=DEFAULT_STEP,
+        help=f'Step size in variants (default: {DEFAULT_STEP})'
+    )
+    bed_parser.add_argument(
+        '--r2-threshold', type=float, default=DEFAULT_R2_THRESHOLD,
+        help=f'r² threshold (default: {DEFAULT_R2_THRESHOLD})'
+    )
+
     # Python method (prune existing data)
     prune_parser = subparsers.add_parser(
         'prune',
-        help='Prune existing dosage data using Python'
+        help='Prune existing dosage data using Python (slower, no PLINK2 needed)'
     )
     prune_parser.add_argument(
         '--variants', required=True,
@@ -523,6 +690,8 @@ def main():
 
     if args.command == 'plink2':
         prune_with_plink2(args)
+    elif args.command == 'from-bed':
+        prune_from_bed(args)
     elif args.command == 'prune':
         prune_existing_data(args)
 
