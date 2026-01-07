@@ -67,16 +67,25 @@ HYENADNA_MODELS = {
 }
 
 
-def load_hyenadna_model(model_name: str, device: str = 'auto'):
+def load_hyenadna_model(
+    model_name: str,
+    device: str = 'auto',
+    use_fp16: bool = False,
+    use_bf16: bool = False,
+    use_compile: bool = False
+):
     """
     Load HyenaDNA model and tokenizer.
 
     Args:
         model_name: One of the HYENADNA_MODELS keys
         device: 'cuda', 'cpu', or 'auto'
+        use_fp16: Use FP16 precision (faster on H100/H200)
+        use_bf16: Use BF16 precision (faster on H100/H200, better numerics)
+        use_compile: Use torch.compile for faster inference
 
     Returns:
-        Tuple of (model, tokenizer, config)
+        Tuple of (model, tokenizer, config, device)
     """
     try:
         import torch
@@ -101,6 +110,16 @@ def load_hyenadna_model(model_name: str, device: str = 'auto'):
 
     logger.info(f"Using device: {device}")
 
+    # Determine dtype for loading
+    if use_bf16 and device == 'cuda':
+        dtype = torch.bfloat16
+        logger.info("Using BF16 precision")
+    elif use_fp16 and device == 'cuda':
+        dtype = torch.float16
+        logger.info("Using FP16 precision")
+    else:
+        dtype = torch.float32
+
     # Load tokenizer and model
     tokenizer = AutoTokenizer.from_pretrained(
         pretrained_name,
@@ -108,11 +127,21 @@ def load_hyenadna_model(model_name: str, device: str = 'auto'):
     )
     model = AutoModel.from_pretrained(
         pretrained_name,
-        trust_remote_code=True
+        trust_remote_code=True,
+        torch_dtype=dtype
     )
 
     model = model.to(device)
     model.eval()
+
+    # Apply torch.compile for faster inference (PyTorch 2.0+)
+    if use_compile and device == 'cuda':
+        try:
+            logger.info("Compiling model with torch.compile (this may take a minute)...")
+            model = torch.compile(model, mode='reduce-overhead')
+            logger.info("Model compiled successfully")
+        except Exception as e:
+            logger.warning(f"torch.compile failed, using eager mode: {e}")
 
     logger.info(f"Model loaded. Embedding dim: {config['embedding_dim']}, Max length: {config['max_length']}")
 
@@ -204,8 +233,14 @@ def generate_embeddings(args):
         logger.error("No valid sequences found!")
         return
 
-    # Load model
-    model, tokenizer, config, device = load_hyenadna_model(args.model_name, args.device)
+    # Load model with precision and compilation options
+    model, tokenizer, config, device = load_hyenadna_model(
+        args.model_name,
+        args.device,
+        use_fp16=args.fp16,
+        use_bf16=args.bf16,
+        use_compile=args.compile
+    )
 
     # Prepare output
     output_path = Path(args.output)
@@ -368,6 +403,22 @@ def main():
         '--pooling', default='mean',
         choices=['mean', 'cls', 'last'],
         help='Pooling strategy for sequence embedding (default: mean)'
+    )
+    parser.add_argument(
+        '--fp16', action='store_true',
+        help='Use FP16 mixed precision (recommended for H100/H200)'
+    )
+    parser.add_argument(
+        '--bf16', action='store_true',
+        help='Use BF16 mixed precision (recommended for H100/H200)'
+    )
+    parser.add_argument(
+        '--compile', action='store_true',
+        help='Use torch.compile for faster inference (PyTorch 2.0+)'
+    )
+    parser.add_argument(
+        '--num-workers', type=int, default=4,
+        help='Number of dataloader workers (default: 4)'
     )
 
     args = parser.parse_args()
