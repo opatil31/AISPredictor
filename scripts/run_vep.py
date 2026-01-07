@@ -524,7 +524,7 @@ def merge_vep_annotations(variants_df: pd.DataFrame, vep_df: pd.DataFrame) -> pd
     """
     Merge VEP annotations with variant data.
 
-    Handles different VEP output formats and column names.
+    Handles different VEP output formats and column names, including VEP REST API format.
     """
     # Identify variant ID column in VEP output
     vep_id_col = None
@@ -532,6 +532,21 @@ def merge_vep_annotations(variants_df: pd.DataFrame, vep_df: pd.DataFrame) -> pd
         if col in vep_df.columns:
             vep_id_col = col
             break
+
+    # Check if VEP output is from REST API (format: "chr start end allele strand")
+    # Example: "6 26092913 26092913 A/G 1"
+    use_positional_merge = False
+    if vep_id_col and vep_id_col in ['Uploaded_variation', '#Uploaded_variation']:
+        # Check first non-null value to determine format
+        sample_val = vep_df[vep_id_col].dropna().iloc[0] if len(vep_df[vep_id_col].dropna()) > 0 else ""
+        # REST API format has spaces and at least 4 parts
+        if ' ' in str(sample_val) and len(str(sample_val).split()) >= 4:
+            logger.info(f"Detected VEP REST API format in {vep_id_col}: '{sample_val}'")
+            use_positional_merge = True
+
+    if use_positional_merge:
+        logger.info("Using positional merge for VEP REST API output")
+        return merge_by_position_from_uploaded_variation(variants_df, vep_df, vep_id_col)
 
     # Identify variant ID column in variants data
     var_id_col = None
@@ -560,6 +575,221 @@ def merge_vep_annotations(variants_df: pd.DataFrame, vep_df: pd.DataFrame) -> pd
         annotated_df = annotated_df.drop(columns=[vep_id_col])
 
     return annotated_df
+
+
+def merge_by_position_from_uploaded_variation(
+    variants_df: pd.DataFrame,
+    vep_df: pd.DataFrame,
+    vep_id_col: str
+) -> pd.DataFrame:
+    """
+    Merge by genomic position when VEP REST API format is used.
+
+    VEP REST API Uploaded_variation format: "chr start end allele_string strand"
+    Example: "6 26092913 26092913 A/G 1"
+    """
+    vep_df = vep_df.copy()
+
+    # Parse Uploaded_variation to extract CHR, POS, REF, ALT
+    def parse_uploaded_var(val):
+        """Parse 'chr start end allele strand' format."""
+        if pd.isna(val):
+            return None, None, None, None
+        parts = str(val).split()
+        if len(parts) >= 4:
+            chrom = parts[0]
+            start = int(parts[1])
+            # parts[2] is end position
+            allele_str = parts[3]  # e.g., "A/G"
+            if '/' in allele_str:
+                ref, alt = allele_str.split('/', 1)
+            else:
+                ref, alt = allele_str, allele_str
+            return chrom, start, ref, alt
+        return None, None, None, None
+
+    # Extract position info from VEP output
+    parsed = vep_df[vep_id_col].apply(parse_uploaded_var)
+    vep_df['CHR_VEP'] = parsed.apply(lambda x: x[0])
+    vep_df['POS_VEP'] = parsed.apply(lambda x: x[1])
+    vep_df['REF_VEP'] = parsed.apply(lambda x: x[2])
+    vep_df['ALT_VEP'] = parsed.apply(lambda x: x[3])
+
+    # Filter out rows where parsing failed
+    vep_df = vep_df[vep_df['CHR_VEP'].notna() & vep_df['POS_VEP'].notna()]
+    logger.info(f"Parsed {len(vep_df):,} VEP annotations with valid positions")
+
+    # Aggregate VEP annotations by position (take most severe consequence)
+    vep_agg = aggregate_vep_by_position(vep_df)
+    logger.info(f"Aggregated to {len(vep_agg):,} unique positions")
+
+    # Prepare variants dataframe for merge
+    variants_df = variants_df.copy()
+
+    # Determine which columns to use for position in variants
+    chr_col = None
+    pos_col = None
+    for c in ['CHR', 'CHROM', '#CHROM', 'chromosome', 'chr']:
+        if c in variants_df.columns:
+            chr_col = c
+            break
+    for p in ['POS', 'BP', 'position', 'pos']:
+        if p in variants_df.columns:
+            pos_col = p
+            break
+
+    if chr_col is None or pos_col is None:
+        logger.warning(f"Could not find CHR/POS columns in variants. Available: {variants_df.columns.tolist()}")
+        return variants_df
+
+    # Normalize chromosome to string without 'chr' prefix
+    variants_df['CHR_str'] = variants_df[chr_col].astype(str).str.replace('chr', '', regex=False)
+    variants_df['POS_int'] = variants_df[pos_col].astype(int)
+
+    # Try to match by CHR + POS + REF + ALT first (most specific)
+    ref_col = None
+    alt_col = None
+    for r in ['REF', 'A1', 'ref', 'reference']:
+        if r in variants_df.columns:
+            ref_col = r
+            break
+    for a in ['ALT', 'A2', 'alt', 'alternate']:
+        if a in variants_df.columns:
+            alt_col = a
+            break
+
+    if ref_col and alt_col:
+        # Try exact match with alleles
+        variants_df['REF_str'] = variants_df[ref_col].astype(str)
+        variants_df['ALT_str'] = variants_df[alt_col].astype(str)
+
+        annotated_df = variants_df.merge(
+            vep_agg,
+            left_on=['CHR_str', 'POS_int', 'REF_str', 'ALT_str'],
+            right_on=['CHR_VEP', 'POS_VEP', 'REF_VEP', 'ALT_VEP'],
+            how='left'
+        )
+
+        n_matched = annotated_df['Consequence'].notna().sum()
+        logger.info(f"Matched {n_matched:,} variants by CHR+POS+REF+ALT")
+
+        # If less than 50% matched, try position-only merge for unmatched
+        if n_matched < len(variants_df) * 0.5:
+            logger.info("Trying position-only merge for unmatched variants...")
+
+            # Get unmatched rows
+            unmatched_mask = annotated_df['Consequence'].isna()
+
+            # Position-only aggregation
+            vep_pos_agg = vep_df.groupby(['CHR_VEP', 'POS_VEP']).first().reset_index()
+
+            # Merge position-only for unmatched
+            unmatched_df = variants_df[unmatched_mask].merge(
+                vep_pos_agg,
+                left_on=['CHR_str', 'POS_int'],
+                right_on=['CHR_VEP', 'POS_VEP'],
+                how='left',
+                suffixes=('', '_pos')
+            )
+
+            # Fill in annotations for previously unmatched rows
+            for col in vep_pos_agg.columns:
+                if col not in ['CHR_VEP', 'POS_VEP'] and col in annotated_df.columns:
+                    annotated_df.loc[unmatched_mask, col] = unmatched_df[col].values
+
+            n_after_pos = annotated_df['Consequence'].notna().sum()
+            logger.info(f"After position-only merge: {n_after_pos:,} variants matched")
+
+        # Clean up temp columns
+        annotated_df = annotated_df.drop(
+            columns=['CHR_str', 'POS_int', 'REF_str', 'ALT_str', 'CHR_VEP', 'POS_VEP', 'REF_VEP', 'ALT_VEP'],
+            errors='ignore'
+        )
+    else:
+        # Position-only merge
+        logger.info("No REF/ALT columns found, using position-only merge")
+        vep_pos_agg = vep_df.groupby(['CHR_VEP', 'POS_VEP']).first().reset_index()
+
+        annotated_df = variants_df.merge(
+            vep_pos_agg,
+            left_on=['CHR_str', 'POS_int'],
+            right_on=['CHR_VEP', 'POS_VEP'],
+            how='left'
+        )
+
+        annotated_df = annotated_df.drop(
+            columns=['CHR_str', 'POS_int', 'CHR_VEP', 'POS_VEP'],
+            errors='ignore'
+        )
+
+    return annotated_df
+
+
+def aggregate_vep_by_position(vep_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate VEP annotations by position, keeping most severe consequence.
+    """
+    # Consequence severity ranking
+    consequence_severity = {
+        'transcript_ablation': 100,
+        'splice_acceptor_variant': 95,
+        'splice_donor_variant': 95,
+        'stop_gained': 90,
+        'frameshift_variant': 90,
+        'stop_lost': 85,
+        'start_lost': 85,
+        'transcript_amplification': 80,
+        'inframe_insertion': 75,
+        'inframe_deletion': 75,
+        'missense_variant': 70,
+        'protein_altering_variant': 65,
+        'splice_region_variant': 60,
+        'incomplete_terminal_codon_variant': 55,
+        'start_retained_variant': 50,
+        'stop_retained_variant': 50,
+        'synonymous_variant': 45,
+        'coding_sequence_variant': 40,
+        'mature_miRNA_variant': 35,
+        '5_prime_UTR_variant': 30,
+        '3_prime_UTR_variant': 30,
+        'non_coding_transcript_exon_variant': 25,
+        'intron_variant': 20,
+        'NMD_transcript_variant': 20,
+        'non_coding_transcript_variant': 15,
+        'upstream_gene_variant': 10,
+        'downstream_gene_variant': 10,
+        'TFBS_ablation': 8,
+        'TFBS_amplification': 8,
+        'TF_binding_site_variant': 8,
+        'regulatory_region_ablation': 7,
+        'regulatory_region_amplification': 7,
+        'regulatory_region_variant': 7,
+        'feature_elongation': 5,
+        'feature_truncation': 5,
+        'intergenic_variant': 1,
+    }
+
+    def get_severity(consequence):
+        """Get maximum severity from comma-separated consequences."""
+        if pd.isna(consequence):
+            return 0
+        consequences = str(consequence).split(',')
+        return max(consequence_severity.get(c.strip(), 0) for c in consequences)
+
+    # Add severity score
+    vep_df = vep_df.copy()
+    vep_df['_severity'] = vep_df['Consequence'].apply(get_severity)
+
+    # Sort by severity (descending) and group by position + alleles
+    vep_df = vep_df.sort_values('_severity', ascending=False)
+
+    # Group by CHR, POS, REF, ALT and take first (most severe)
+    agg_df = vep_df.groupby(['CHR_VEP', 'POS_VEP', 'REF_VEP', 'ALT_VEP']).first().reset_index()
+
+    # Drop temporary column
+    agg_df = agg_df.drop(columns=['_severity'], errors='ignore')
+
+    return agg_df
 
 
 def merge_by_position(variants_df: pd.DataFrame, vep_df: pd.DataFrame) -> pd.DataFrame:
