@@ -335,12 +335,12 @@ def convert_raw(args):
 
 
 def convert_raw_chunked(args):
-    """Convert large PLINK2 .raw export using chunked reading."""
+    """Convert large PLINK2 .raw export using line-by-line reading (fast)."""
     raw_path = Path(args.raw)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Loading PLINK2 export from {raw_path} (chunked mode)")
+    logger.info(f"Loading PLINK2 export from {raw_path} (fast line-by-line mode)")
 
     # Read header first
     with open(raw_path, 'r') as f:
@@ -374,21 +374,36 @@ def convert_raw_chunked(args):
         logger.error("zarr is required for chunked mode. Install with: pip install zarr")
         return
 
-    # Read in chunks
-    chunk_size = args.chunk_size
+    # Read line by line (much faster than pandas for wide files)
     sample_ids = []
 
-    logger.info(f"Reading in chunks of {chunk_size}...")
+    logger.info(f"Reading {n_samples} samples line by line...")
 
-    for i, chunk in enumerate(pd.read_csv(raw_path, sep=r'\s+', na_values='NA', chunksize=chunk_size)):
-        start_idx = i * chunk_size
-        end_idx = start_idx + len(chunk)
+    with open(raw_path, 'r') as f:
+        # Skip header
+        f.readline()
 
-        sample_ids.extend(chunk['IID'].astype(str).tolist())
-        zarr_array[start_idx:end_idx, :] = chunk[variant_cols].values.astype(np.float32)
+        for i, line in enumerate(f):
+            # Split line
+            parts = line.strip().split()
 
-        if (i + 1) % 10 == 0:
-            logger.info(f"Processed {end_idx:,} samples...")
+            # First 6 columns are metadata: FID IID PAT MAT SEX PHENOTYPE
+            sample_ids.append(parts[1])  # IID
+
+            # Remaining columns are dosages
+            dosages = []
+            for val in parts[6:]:
+                if val == 'NA':
+                    dosages.append(np.nan)
+                else:
+                    dosages.append(float(val))
+
+            # Write to zarr
+            zarr_array[i, :] = np.array(dosages, dtype=np.float32)
+
+            # Progress every 100 samples
+            if (i + 1) % 100 == 0:
+                logger.info(f"Processed {i + 1:,}/{n_samples:,} samples ({100*(i+1)/n_samples:.1f}%)")
 
     logger.info(f"Loaded {len(sample_ids)} samples")
 
