@@ -754,7 +754,7 @@ For each patient, generate:
 ### 8.1 Gantt Chart
 
 ```
-Week    1    2    3    4    5    6    7    8    9    10
+Stage    1    2    3    4    5    6    7    8    9    10
         ─────────────────────────────────────────────────
 Phase 0 ████                                              Cohort Definition
 Phase 1      ████                                         Variant Extraction
@@ -771,7 +771,7 @@ Phase 9                                         ████      Validation & R
 
 ### 8.2 Detailed Phase Breakdown
 
-| Phase | Week | Description | Deliverable | Dependencies |
+| Phase | Stage | Description | Deliverable | Dependencies |
 |-------|------|-------------|-------------|--------------|
 | **0** | 1 | Cohort definition | `cohort.parquet` | UK Biobank access |
 | | | - Ancestry QC | | |
@@ -807,14 +807,13 @@ Phase 9                                         ████      Validation & R
 
 ### 8.3 Milestones
 
-| Milestone | Target Date | Success Criterion |
+| Milestone | Target Stage | Success Criterion |
 |-----------|-------------|-------------------|
-| **M1:** Cohort ready | Week 1 | ~15k samples with labels |
-| **M2:** Data pipeline complete | Week 5 | DataLoader returns valid batches |
-| **M3:** Baseline established | Week 5 | Mean pooling AUROC computed |
-| **M4:** Model trained | Week 8 | CV AUROC > baseline |
-| **M5:** Validation complete | Week 9 | GPR126 in top 5% |
-| **M6:** Final delivery | Week 10 | Patient reports generated |
+| **M1:** Cohort ready | Stage 1 | ~15k samples with labels |
+| **M2:** Data pipeline complete | Stage 5 | DataLoader returns valid batches |
+| **M3:** Baseline established | Stage 5 | Mean pooling AUROC computed |
+| **M4:** Model trained | Stage 8 | CV AUROC > baseline |
+| **M5:** Validation complete | Stage 9 | GPR126 in top 5% |
 
 ---
 
