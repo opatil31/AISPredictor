@@ -1,0 +1,111 @@
+# Phase 0: Cohort Definition Configuration
+# UK Biobank AIS Case-Control Study
+
+# ============================================================================
+# UK Biobank Field IDs
+# ============================================================================
+ukb_fields:
+  genetic_pcs: "22009"           # Genetic principal components (1-40)
+  genetic_ethnicity: "22006"     # Genetic ethnic grouping
+  self_reported_ethnicity: "21000"  # Ethnic background (self-reported)
+  icd10_diagnoses: "41270"       # Diagnoses - ICD10 (hospital inpatient)
+  sex: "31"                      # Sex
+  age_at_recruitment: "21003"    # Age when attended assessment centre
+  genotype_batch: "22000"        # Genotype measurement batch
+
+# ============================================================================
+# Case Identification
+# ============================================================================
+case_identification:
+  # ICD-10 codes for Adolescent Idiopathic Scoliosis
+  icd10_codes:
+    - "M41.1"   # Juvenile idiopathic scoliosis (~500 expected)
+    - "M41.2"   # Other idiopathic scoliosis (~2,500 expected)
+
+  # All scoliosis codes for exclusion from controls
+  scoliosis_exclusion_codes:
+    - "M41"     # All scoliosis diagnoses (M41.x)
+    - "M41.0"   # Infantile idiopathic scoliosis
+    - "M41.1"   # Juvenile idiopathic scoliosis
+    - "M41.2"   # Other idiopathic scoliosis
+    - "M41.3"   # Thoracogenic scoliosis
+    - "M41.4"   # Neuromuscular scoliosis
+    - "M41.5"   # Other secondary scoliosis
+    - "M41.8"   # Other forms of scoliosis
+    - "M41.9"   # Scoliosis, unspecified
+
+# ============================================================================
+# Ancestry Quality Control
+# ============================================================================
+ancestry_qc:
+  # Self-reported European ancestry codes (field 21000)
+  european_codes:
+    - 1       # White
+    - 1001    # British
+    - 1002    # Irish
+    - 1003    # Any other white background
+
+  # PCA-based outlier removal
+  pca_outlier_removal:
+    n_pcs: 4                    # Number of PCs to use for outlier detection
+    sd_threshold: 6.0           # Remove samples > 6 SD from mean
+
+  # Genetic ethnicity filter (field 22006) - optional additional filter
+  use_genetic_ethnicity: true
+  genetic_european_code: 1      # Caucasian in genetic ethnic grouping
+
+# ============================================================================
+# Control Selection
+# ============================================================================
+control_matching:
+  # Matching ratio
+  controls_per_case: 4          # 4:1 control-to-case ratio
+
+  # Matching variables
+  matching_variables:
+    - "age"                     # Age at recruitment
+    - "sex"                     # Sex
+    - "pc1"                     # Genetic PC1
+    - "pc2"                     # Genetic PC2
+    - "pc3"                     # Genetic PC3
+    - "pc4"                     # Genetic PC4
+
+  # Optional matching variables
+  optional_matching:
+    use_genotype_batch: false   # Include genotype batch in matching
+
+  # Matching algorithm parameters
+  algorithm:
+    method: "nearest_neighbor"  # Matching method
+    replacement: false          # Sample without replacement
+    caliper: null               # Optional caliper (in SD units), null = no caliper
+
+  # Relatedness exclusion
+  kinship:
+    exclude_related: true
+    king_threshold: 0.0884      # 2nd degree relatives or closer
+    kinship_file: null          # Path to KING kinship file (if available)
+
+# ============================================================================
+# Output Configuration
+# ============================================================================
+output:
+  directory: "data/cohort"
+  files:
+    cohort: "cohort.parquet"
+    matching_info: "matching_info.parquet"
+    ancestry_pcs: "ancestry_pcs.parquet"
+
+  # Additional outputs
+  save_intermediate: true
+  save_qc_report: true
+
+# ============================================================================
+# Expected Cohort Sizes
+# ============================================================================
+expected_counts:
+  total_ukb_samples: 500000
+  after_ancestry_filter: 450000
+  expected_cases: 3000
+  expected_controls: 12000
+  final_cohort: 15000

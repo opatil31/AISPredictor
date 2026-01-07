@@ -1,0 +1,36 @@
+# AIS Predictor - Requirements
+# Phase 0: Cohort Definition
+
+# Core dependencies
+numpy>=1.24
+pandas>=2.0
+scipy>=1.10
+scikit-learn>=1.2
+
+# Data formats
+pyarrow>=12.0
+pyyaml>=6.0
+
+# Logging and CLI
+tqdm>=4.65
+
+# Phase 1+ dependencies (install when needed)
+# zarr>=2.14
+# pgenlib>=0.90
+# pyfaidx>=0.7
+
+# Phase 3+ dependencies (install when needed)
+# torch>=2.0
+# transformers>=4.30
+# safetensors>=0.3
+
+# Phase 4+ dependencies (install when needed)
+# pytorch-lightning>=2.0
+# torchmetrics>=1.0
+
+# Phase 6+ dependencies (install when needed)
+# captum>=0.6
+
+# Visualization (optional)
+# matplotlib>=3.7
+# seaborn>=0.12
