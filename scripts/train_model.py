@@ -468,7 +468,10 @@ def train_model_cv(
     learning_rate: float = 1e-3,
     weight_decay: float = 0.1,
     patience: int = 15,
-    device: str = 'auto'
+    device: str = 'auto',
+    use_fp16: bool = False,
+    use_bf16: bool = False,
+    use_compile: bool = False
 ) -> Tuple[object, Dict]:
     """
     Train model with stratified k-fold cross-validation.
@@ -483,6 +486,16 @@ def train_model_cv(
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logger.info(f"Training on device: {device}")
+
+    # Setup mixed precision training
+    use_amp = (use_fp16 or use_bf16) and device == 'cuda'
+    if use_amp:
+        amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+        scaler = torch.amp.GradScaler('cuda', enabled=use_fp16)  # BF16 doesn't need scaling
+        logger.info(f"Using mixed precision training with {'BF16' if use_bf16 else 'FP16'}")
+    else:
+        amp_dtype = torch.float32
+        scaler = None
 
     # Convert to tensors
     embeddings_t = torch.FloatTensor(embeddings)
@@ -521,6 +534,15 @@ def train_model_cv(
             model = build_baseline_model(embedding_dim=embedding_dim)
         model = model.to(device)
 
+        # Apply torch.compile for faster training (PyTorch 2.0+)
+        if use_compile and device == 'cuda' and fold == 0:  # Only compile once
+            try:
+                logger.info("Compiling model with torch.compile...")
+                model = torch.compile(model, mode='reduce-overhead')
+                logger.info("Model compiled successfully")
+            except Exception as e:
+                logger.warning(f"torch.compile failed: {e}")
+
         # Move shared tensors to device
         emb_device = embeddings_t.to(device)
         pos_device = positions_t.to(device)
@@ -556,14 +578,30 @@ def train_model_cv(
                 batch_reg = reg_device.unsqueeze(0).expand(batch_size_actual, -1)
 
                 optimizer.zero_grad()
-                logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
-                loss = criterion(logits, batch_labels)
-                loss.backward()
 
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                # Mixed precision forward pass
+                if use_amp:
+                    with torch.amp.autocast('cuda', dtype=amp_dtype):
+                        logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
+                        loss = criterion(logits, batch_labels)
 
-                optimizer.step()
+                    if scaler is not None:
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                else:
+                    logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
+                    loss = criterion(logits, batch_labels)
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+
                 train_loss += loss.item()
 
             scheduler.step()
@@ -581,7 +619,11 @@ def train_model_cv(
                     batch_pos = pos_device.unsqueeze(0).expand(batch_size_actual, -1)
                     batch_reg = reg_device.unsqueeze(0).expand(batch_size_actual, -1)
 
-                    logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
+                    if use_amp:
+                        with torch.amp.autocast('cuda', dtype=amp_dtype):
+                            logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
+                    else:
+                        logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
                     probs = torch.softmax(logits, dim=-1)[:, 1]
 
                     val_probs.extend(probs.cpu().numpy())
@@ -718,14 +760,37 @@ def train_model(args):
         count = (region_types == i).sum()
         logger.info(f"  {rtype}: {count:,} ({100*count/len(region_types):.1f}%)")
 
-    # Load dosages
+    # Load dosages (supports both parquet and zarr formats)
     logger.info(f"Loading dosages from {args.dosages}")
-    dosages_df = pd.read_parquet(args.dosages)
+    dosages_path = Path(args.dosages)
 
-    variant_cols = ['SNP', 'CHR', 'POS', 'A1', 'A2', 'REF', 'ALT', 'variant_id']
-    sample_cols = [c for c in dosages_df.columns if c not in variant_cols]
-    dosages = dosages_df[sample_cols].values.T  # (n_samples, n_variants)
-    sample_ids = sample_cols
+    if str(dosages_path).endswith('.zarr') or (dosages_path.is_dir() and (dosages_path / '.zarray').exists()):
+        # Zarr format: (n_samples, n_variants) array
+        try:
+            import zarr
+            dosages = np.array(zarr.open(str(dosages_path), mode='r'))
+            logger.info(f"Loaded zarr dosages: {dosages.shape}")
+
+            # Try to load sample IDs from accompanying file
+            sample_ids_path = dosages_path.parent / 'sample_ids.txt'
+            if not sample_ids_path.exists():
+                sample_ids_path = dosages_path.with_suffix('.sample_ids.txt')
+            if sample_ids_path.exists():
+                with open(sample_ids_path, 'r') as f:
+                    sample_ids = [line.strip() for line in f if line.strip()]
+                logger.info(f"Loaded {len(sample_ids)} sample IDs")
+            else:
+                sample_ids = [f"sample_{i}" for i in range(dosages.shape[0])]
+                logger.warning(f"No sample_ids.txt found, using generic IDs")
+        except ImportError:
+            raise ImportError("zarr required for .zarr dosages. Install with: pip install zarr")
+    else:
+        # Parquet format: rows=variants, columns=samples
+        dosages_df = pd.read_parquet(args.dosages)
+        variant_cols = ['SNP', 'CHR', 'POS', 'A1', 'A2', 'REF', 'ALT', 'variant_id']
+        sample_cols = [c for c in dosages_df.columns if c not in variant_cols]
+        dosages = dosages_df[sample_cols].values.T  # (n_samples, n_variants)
+        sample_ids = sample_cols
 
     logger.info(f"Dosages shape: {dosages.shape}")
 
@@ -786,7 +851,10 @@ def train_model(args):
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         patience=args.patience,
-        device=args.device
+        device=args.device,
+        use_fp16=args.fp16,
+        use_bf16=args.bf16,
+        use_compile=args.compile
     )
 
     # Save model and results
@@ -886,6 +954,12 @@ def main():
     parser.add_argument('--device', default='auto',
                        choices=['auto', 'cuda', 'cpu'],
                        help='Device (default: auto)')
+    parser.add_argument('--fp16', action='store_true',
+                       help='Use FP16 mixed precision training (faster on H100/H200)')
+    parser.add_argument('--bf16', action='store_true',
+                       help='Use BF16 mixed precision training (recommended for H100/H200)')
+    parser.add_argument('--compile', action='store_true',
+                       help='Use torch.compile for faster training (PyTorch 2.0+)')
 
     args = parser.parse_args()
     train_model(args)
