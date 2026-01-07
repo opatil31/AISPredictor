@@ -14,10 +14,10 @@ pyyaml>=6.0
 # Logging and CLI
 tqdm>=4.65
 
-# Phase 1+ dependencies (install when needed)
-# zarr>=2.14
-# pgenlib>=0.90
-# pyfaidx>=0.7
+# Phase 1: Variant Extraction
+zarr>=2.14
+pgenlib>=0.90
+pyfaidx>=0.7
 
 # Phase 3+ dependencies (install when needed)
 # torch>=2.0
