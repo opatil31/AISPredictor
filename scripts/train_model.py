@@ -2,15 +2,19 @@
 """
 Phase 5: AIS Prediction Model Training
 
-Trains a model to predict Acute Ischemic Stroke (AIS) risk using:
-- HyenaDNA embeddings (variant sequence representations)
-- VEP annotations (functional consequences)
-- Genotype dosages (sample-level variant calls)
+Implements the hierarchical attention architecture from the implementation plan:
+- Input projection with positional encoding
+- Region-type attention pooling (8 region types)
+- Region combination layer
+- Classification head
 
-Architecture options:
-1. Simple: Aggregated variant features → MLP classifier
-2. Attention: Per-variant features → Attention pooling → MLP classifier
-3. SetTransformer: Per-variant features → Set Transformer → MLP classifier
+Architecture (~100k parameters):
+1. Input: dosage-scaled delta embeddings (batch, n_variants, 256)
+2. Input Projection: Linear(256→64) → LayerNorm → GELU → Dropout
+3. Positional Encoding: Sinusoidal based on genomic position
+4. Region Attention: Learned query per region → attention → region embedding
+5. Region Combination: Concat(8×64) → MLP → patient embedding
+6. Classifier: LayerNorm → MLP → P(AIS)
 
 Usage:
     python scripts/train_model.py \
@@ -19,23 +23,23 @@ Usage:
         --dosages data/variants/pruned/chr6_pruned_dosages.parquet \
         --cohort data/cohorts/ais_cohort.parquet \
         --output models/ais_model \
-        --model-type attention
+        --model-type hierarchical
 
 """
 
 import argparse
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, f1_score,
-    precision_score, recall_score, confusion_matrix,
-    classification_report
+    precision_score, recall_score, classification_report
 )
 from sklearn.preprocessing import StandardScaler
 
@@ -45,18 +49,35 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Region type mapping (from VEP consequences)
+REGION_TYPES = ['promoter', 'utr5', 'exon', 'intron', 'utr3', 'splice', 'downstream', 'other']
+REGION_TYPE_MAP = {
+    'upstream_gene_variant': 'promoter',
+    '5_prime_UTR_variant': 'utr5',
+    'missense_variant': 'exon',
+    'synonymous_variant': 'exon',
+    'stop_gained': 'exon',
+    'stop_lost': 'exon',
+    'start_lost': 'exon',
+    'frameshift_variant': 'exon',
+    'inframe_insertion': 'exon',
+    'inframe_deletion': 'exon',
+    'intron_variant': 'intron',
+    '3_prime_UTR_variant': 'utr3',
+    'splice_acceptor_variant': 'splice',
+    'splice_donor_variant': 'splice',
+    'splice_region_variant': 'splice',
+    'downstream_gene_variant': 'downstream',
+    'intergenic_variant': 'other',
+    'regulatory_region_variant': 'other',
+}
+
 
 def load_embeddings(embeddings_path: str) -> Dict[str, np.ndarray]:
-    """
-    Load HyenaDNA embeddings from zarr or numpy files.
-
-    Returns:
-        Dict with 'ref', 'alt', 'diff' embeddings
-    """
+    """Load HyenaDNA embeddings from zarr or numpy files."""
     embeddings_path = Path(embeddings_path)
     embeddings = {}
 
-    # Try zarr first, then numpy
     for key in ['ref', 'alt', 'diff']:
         zarr_path = embeddings_path.with_suffix(f'.{key}.zarr')
         npy_path = embeddings_path.with_suffix(f'.{key}.npy')
@@ -67,7 +88,7 @@ def load_embeddings(embeddings_path: str) -> Dict[str, np.ndarray]:
                 embeddings[key] = np.array(zarr.open(str(zarr_path), mode='r'))
                 logger.info(f"Loaded {key} embeddings from zarr: {embeddings[key].shape}")
             except ImportError:
-                logger.warning("zarr not available, trying numpy")
+                pass
 
         if key not in embeddings and npy_path.exists():
             embeddings[key] = np.load(npy_path)
@@ -79,298 +100,345 @@ def load_embeddings(embeddings_path: str) -> Dict[str, np.ndarray]:
     return embeddings
 
 
-def load_annotations(annotations_path: str) -> pd.DataFrame:
-    """Load VEP annotations and encode categorical features."""
-    logger.info(f"Loading annotations from {annotations_path}")
-    df = pd.read_parquet(annotations_path)
-    logger.info(f"Loaded {len(df):,} variants with annotations")
-    return df
+def get_region_type(consequence: str) -> int:
+    """Map VEP consequence to region type index."""
+    region = REGION_TYPE_MAP.get(consequence, 'other')
+    return REGION_TYPES.index(region)
 
 
-def encode_vep_features(df: pd.DataFrame) -> np.ndarray:
-    """
-    Encode VEP annotations into numerical features.
-
-    Features extracted:
-    - Consequence type (one-hot)
-    - SIFT score (numeric, imputed)
-    - PolyPhen score (numeric, imputed)
-    - Impact category (ordinal)
-    - CADD score if available
-    """
-    features = []
-
-    # Consequence types to encode
-    consequence_types = [
-        'missense_variant', 'synonymous_variant', 'intron_variant',
-        'upstream_gene_variant', 'downstream_gene_variant',
-        '3_prime_UTR_variant', '5_prime_UTR_variant',
-        'splice_region_variant', 'splice_donor_variant', 'splice_acceptor_variant',
-        'stop_gained', 'stop_lost', 'start_lost', 'frameshift_variant',
-        'inframe_insertion', 'inframe_deletion', 'regulatory_region_variant',
-        'intergenic_variant'
-    ]
-
-    # One-hot encode consequence types
-    if 'most_severe_consequence' in df.columns:
-        for ctype in consequence_types:
-            features.append(
-                (df['most_severe_consequence'] == ctype).astype(float).values.reshape(-1, 1)
-            )
-    elif 'consequence_terms' in df.columns:
-        # Handle list column
-        for ctype in consequence_types:
-            col = df['consequence_terms'].apply(
-                lambda x: 1.0 if isinstance(x, list) and ctype in x else 0.0
-            )
-            features.append(col.values.reshape(-1, 1))
-
-    # Impact category (ordinal encoding)
-    impact_map = {'MODIFIER': 0, 'LOW': 1, 'MODERATE': 2, 'HIGH': 3}
-    if 'impact' in df.columns:
-        impact_encoded = df['impact'].map(impact_map).fillna(0).values.reshape(-1, 1)
-        features.append(impact_encoded)
-
-    # SIFT score (lower = more damaging)
-    if 'sift_score' in df.columns:
-        sift = df['sift_score'].fillna(1.0).values.reshape(-1, 1)  # 1.0 = tolerated
-        features.append(sift)
-
-    # PolyPhen score (higher = more damaging)
-    if 'polyphen_score' in df.columns:
-        polyphen = df['polyphen_score'].fillna(0.0).values.reshape(-1, 1)  # 0 = benign
-        features.append(polyphen)
-
-    # CADD score if available
-    if 'cadd_phred' in df.columns:
-        cadd = df['cadd_phred'].fillna(0.0).values.reshape(-1, 1)
-        features.append(cadd)
-
-    if not features:
-        logger.warning("No VEP features found, using empty array")
-        return np.zeros((len(df), 1))
-
-    return np.hstack(features)
-
-
-def load_dosages(dosages_path: str) -> Tuple[np.ndarray, List[str], List[str]]:
-    """
-    Load genotype dosages.
-
-    Returns:
-        Tuple of (dosage_matrix, sample_ids, variant_ids)
-        dosage_matrix shape: (n_samples, n_variants)
-    """
-    logger.info(f"Loading dosages from {dosages_path}")
-    df = pd.read_parquet(dosages_path)
-
-    # Identify sample columns (exclude variant ID columns)
-    variant_cols = ['SNP', 'CHR', 'POS', 'A1', 'A2', 'REF', 'ALT', 'variant_id']
-    sample_cols = [c for c in df.columns if c not in variant_cols]
-
-    variant_ids = df['SNP'].tolist() if 'SNP' in df.columns else df.index.tolist()
-
-    # Transpose: we want (samples, variants)
-    dosage_matrix = df[sample_cols].values.T
-    sample_ids = sample_cols
-
-    logger.info(f"Dosage matrix shape: {dosage_matrix.shape} (samples × variants)")
-
-    return dosage_matrix, sample_ids, variant_ids
-
-
-def load_cohort(cohort_path: str) -> pd.DataFrame:
-    """Load cohort definition with case/control labels."""
-    logger.info(f"Loading cohort from {cohort_path}")
-    df = pd.read_parquet(cohort_path)
-
-    # Identify label column
-    label_cols = ['is_case', 'case', 'label', 'AIS', 'phenotype']
-    label_col = None
-    for col in label_cols:
-        if col in df.columns:
-            label_col = col
-            break
-
-    if label_col is None:
-        raise ValueError(f"No label column found. Expected one of: {label_cols}")
-
-    # Standardize column name
-    df['label'] = df[label_col].astype(int)
-
-    n_cases = df['label'].sum()
-    n_controls = len(df) - n_cases
-    logger.info(f"Cohort: {n_cases:,} cases, {n_controls:,} controls")
-
-    return df
-
-
-def create_sample_features(
-    dosages: np.ndarray,
-    embeddings: Dict[str, np.ndarray],
-    vep_features: np.ndarray,
-    aggregation: str = 'weighted'
-) -> np.ndarray:
-    """
-    Create sample-level features by aggregating variant features.
-
-    Args:
-        dosages: (n_samples, n_variants) genotype dosages
-        embeddings: Dict with variant embeddings
-        vep_features: (n_variants, n_vep_features)
-        aggregation: 'weighted', 'mean', or 'presence'
-
-    Returns:
-        Sample feature matrix (n_samples, feature_dim)
-    """
-    n_samples, n_variants = dosages.shape
-
-    # Use difference embeddings (alt - ref) as they capture variant effect
-    if 'diff' in embeddings:
-        variant_emb = embeddings['diff']
-    elif 'alt' in embeddings and 'ref' in embeddings:
-        variant_emb = embeddings['alt'] - embeddings['ref']
-    else:
-        variant_emb = list(embeddings.values())[0]
-
-    # Combine embeddings and VEP features
-    variant_features = np.hstack([variant_emb, vep_features])
-    logger.info(f"Variant feature dimension: {variant_features.shape[1]}")
-
-    # Aggregate across variants for each sample
-    if aggregation == 'weighted':
-        # Weight by dosage: sum(dosage * features) / sum(dosage)
-        # This gives more weight to variants the sample carries
-        sample_features = []
-        for i in range(n_samples):
-            weights = dosages[i]
-            if weights.sum() > 0:
-                weighted_feat = (weights[:, np.newaxis] * variant_features).sum(axis=0) / weights.sum()
-            else:
-                weighted_feat = np.zeros(variant_features.shape[1])
-            sample_features.append(weighted_feat)
-        sample_features = np.array(sample_features)
-
-    elif aggregation == 'mean':
-        # Simple mean of features for variants present (dosage > 0.5)
-        sample_features = []
-        for i in range(n_samples):
-            present = dosages[i] > 0.5
-            if present.sum() > 0:
-                mean_feat = variant_features[present].mean(axis=0)
-            else:
-                mean_feat = np.zeros(variant_features.shape[1])
-            sample_features.append(mean_feat)
-        sample_features = np.array(sample_features)
-
-    elif aggregation == 'presence':
-        # Binary presence/absence features
-        sample_features = (dosages > 0.5).astype(float)
-
-    else:
-        raise ValueError(f"Unknown aggregation: {aggregation}")
-
-    logger.info(f"Sample feature matrix: {sample_features.shape}")
-    return sample_features
-
-
-def build_mlp_model(input_dim: int, hidden_dims: List[int], dropout: float = 0.3):
-    """Build a simple MLP classifier using PyTorch."""
-    import torch
-    import torch.nn as nn
-
-    layers = []
-    prev_dim = input_dim
-
-    for hidden_dim in hidden_dims:
-        layers.extend([
-            nn.Linear(prev_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        ])
-        prev_dim = hidden_dim
-
-    layers.append(nn.Linear(prev_dim, 1))
-
-    return nn.Sequential(*layers)
-
-
-def build_attention_model(
-    embedding_dim: int,
-    vep_dim: int,
+def build_hierarchical_model(
+    embedding_dim: int = 256,
+    d_model: int = 64,
+    n_heads: int = 2,
+    n_regions: int = 8,
     hidden_dim: int = 128,
-    n_heads: int = 4,
     dropout: float = 0.3
 ):
     """
-    Build attention-based model that processes per-variant features.
+    Build the hierarchical attention model as specified in the implementation plan.
 
     Architecture:
-    1. Project variant features to hidden_dim
-    2. Multi-head self-attention over variants
-    3. Attention pooling to aggregate
-    4. MLP classifier
+    - Input projection: Linear(256→64) → LayerNorm → GELU → Dropout
+    - Positional encoding: Sinusoidal
+    - Region attention pooling: Learned query per region
+    - Region combination: MLP
+    - Classifier head
+
+    ~100k parameters total
     """
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
 
-    class AttentionAggregator(nn.Module):
-        def __init__(self, input_dim, hidden_dim, n_heads, dropout):
+    class PositionalEncoding(nn.Module):
+        """Sinusoidal positional encoding based on genomic position."""
+
+        def __init__(self, d_model: int, max_position: int = 200_000_000):
             super().__init__()
-            self.input_proj = nn.Linear(input_dim, hidden_dim)
-            self.attention = nn.MultiheadAttention(hidden_dim, n_heads, dropout=dropout, batch_first=True)
-            self.pool_attention = nn.Linear(hidden_dim, 1)
-            self.classifier = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, 1)
+            self.d_model = d_model
+            self.scale = 1e8  # Normalize positions
+
+        def forward(self, positions: torch.Tensor) -> torch.Tensor:
+            """
+            Args:
+                positions: (batch, n_variants) genomic positions
+            Returns:
+                (batch, n_variants, d_model) positional embeddings
+            """
+            positions = positions.float() / self.scale
+
+            # Create dimension indices
+            dim = torch.arange(self.d_model, device=positions.device).float()
+            div_term = torch.exp(dim * (-math.log(10000.0) / self.d_model))
+
+            # Compute sinusoidal encoding
+            positions = positions.unsqueeze(-1)  # (batch, n_variants, 1)
+            pe = torch.zeros(*positions.shape[:-1], self.d_model, device=positions.device)
+            pe[..., 0::2] = torch.sin(positions * div_term[0::2])
+            pe[..., 1::2] = torch.cos(positions * div_term[1::2])
+
+            return pe
+
+    class RegionAttentionPooling(nn.Module):
+        """Attention pooling for each region type with learned queries."""
+
+        def __init__(self, d_model: int, n_regions: int, n_heads: int, dropout: float):
+            super().__init__()
+            self.d_model = d_model
+            self.n_regions = n_regions
+            self.n_heads = n_heads
+
+            # Learned query vector for each region type
+            self.region_queries = nn.Parameter(torch.randn(n_regions, d_model))
+
+            # Key and Value projections
+            self.key_proj = nn.Linear(d_model, d_model)
+            self.value_proj = nn.Linear(d_model, d_model)
+
+            # Learned embedding for empty regions
+            self.empty_embedding = nn.Parameter(torch.randn(n_regions, d_model))
+
+            self.dropout = nn.Dropout(dropout)
+            self.scale = math.sqrt(d_model)
+
+        def forward(
+            self,
+            x: torch.Tensor,
+            region_types: torch.Tensor,
+            mask: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+            """
+            Args:
+                x: (batch, n_variants, d_model) variant embeddings
+                region_types: (batch, n_variants) region type indices (0-7)
+                mask: (batch, n_variants) True for valid variants
+
+            Returns:
+                (batch, n_regions, d_model) region embeddings
+            """
+            batch_size = x.shape[0]
+            device = x.device
+
+            # Project to keys and values
+            keys = self.key_proj(x)  # (batch, n_variants, d_model)
+            values = self.value_proj(x)  # (batch, n_variants, d_model)
+
+            # Initialize region embeddings
+            region_embeddings = torch.zeros(batch_size, self.n_regions, self.d_model, device=device)
+
+            for r in range(self.n_regions):
+                # Get query for this region
+                query = self.region_queries[r]  # (d_model,)
+
+                # Create mask for variants in this region
+                region_mask = (region_types == r)  # (batch, n_variants)
+                if mask is not None:
+                    region_mask = region_mask & mask
+
+                # Check if any variants in this region
+                has_variants = region_mask.any(dim=1)  # (batch,)
+
+                if has_variants.any():
+                    # Compute attention scores
+                    scores = torch.einsum('d,bnd->bn', query, keys) / self.scale  # (batch, n_variants)
+
+                    # Mask out variants not in this region
+                    scores = scores.masked_fill(~region_mask, float('-inf'))
+
+                    # Softmax attention
+                    attn = F.softmax(scores, dim=-1)  # (batch, n_variants)
+                    attn = self.dropout(attn)
+
+                    # Handle NaN from all -inf (no variants in region)
+                    attn = torch.nan_to_num(attn, nan=0.0)
+
+                    # Weighted sum of values
+                    region_emb = torch.einsum('bn,bnd->bd', attn, values)  # (batch, d_model)
+
+                    # Use empty embedding for samples with no variants in this region
+                    region_emb = torch.where(
+                        has_variants.unsqueeze(-1),
+                        region_emb,
+                        self.empty_embedding[r].unsqueeze(0).expand(batch_size, -1)
+                    )
+
+                    region_embeddings[:, r] = region_emb
+                else:
+                    # All samples have no variants in this region
+                    region_embeddings[:, r] = self.empty_embedding[r].unsqueeze(0).expand(batch_size, -1)
+
+            return region_embeddings
+
+    class HierarchicalAISModel(nn.Module):
+        """
+        Hierarchical attention model for AIS prediction.
+
+        Architecture from implementation plan:
+        1. Input projection: Linear(256→64) → LayerNorm → GELU → Dropout
+        2. Add positional encoding
+        3. Region attention pooling with learned queries
+        4. Region combination: Concat → MLP
+        5. Classification head
+        """
+
+        def __init__(
+            self,
+            embedding_dim: int = 256,
+            d_model: int = 64,
+            n_heads: int = 2,
+            n_regions: int = 8,
+            hidden_dim: int = 128,
+            dropout: float = 0.3
+        ):
+            super().__init__()
+
+            self.embedding_dim = embedding_dim
+            self.d_model = d_model
+            self.n_regions = n_regions
+
+            # Input projection (256 → 64)
+            self.input_proj = nn.Sequential(
+                nn.Linear(embedding_dim, d_model),
+                nn.LayerNorm(d_model),
+                nn.GELU(),
+                nn.Dropout(dropout)
             )
 
-        def forward(self, x, mask=None):
-            # x: (batch, n_variants, feature_dim)
-            # mask: (batch, n_variants) - True for valid variants
+            # Positional encoding
+            self.pos_encoding = PositionalEncoding(d_model)
 
-            # Project to hidden dim
-            h = self.input_proj(x)  # (batch, n_variants, hidden_dim)
+            # Region attention pooling
+            self.region_attention = RegionAttentionPooling(d_model, n_regions, n_heads, dropout)
 
-            # Self-attention
+            # Region combination layer
+            # Input: concatenated region embeddings (8 × 64 = 512)
+            # Output: patient embedding (64)
+            self.region_combination = nn.Sequential(
+                nn.Linear(n_regions * d_model, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, d_model)
+            )
+
+            # Classification head
+            self.classifier = nn.Sequential(
+                nn.LayerNorm(d_model),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, 32),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, 2)  # [control, case] logits
+            )
+
+            self._init_weights()
+
+        def _init_weights(self):
+            """Initialize weights."""
+            for module in self.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+        def forward(
+            self,
+            embeddings: torch.Tensor,
+            positions: torch.Tensor,
+            region_types: torch.Tensor,
+            dosages: torch.Tensor,
+            mask: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+            """
+            Forward pass.
+
+            Args:
+                embeddings: (batch, n_variants, embedding_dim) delta embeddings
+                positions: (batch, n_variants) genomic positions
+                region_types: (batch, n_variants) region type indices
+                dosages: (batch, n_variants) genotype dosages
+                mask: (batch, n_variants) True for valid variants
+
+            Returns:
+                (batch, 2) logits for [control, case]
+            """
+            # Scale embeddings by dosage
+            x = embeddings * dosages.unsqueeze(-1)  # (batch, n_variants, embedding_dim)
+
+            # Input projection
+            x = self.input_proj(x)  # (batch, n_variants, d_model)
+
+            # Add positional encoding
+            pos_emb = self.pos_encoding(positions)  # (batch, n_variants, d_model)
+            x = x + pos_emb
+
+            # Region attention pooling
+            region_emb = self.region_attention(x, region_types, mask)  # (batch, n_regions, d_model)
+
+            # Flatten region embeddings
+            region_flat = region_emb.view(region_emb.shape[0], -1)  # (batch, n_regions * d_model)
+
+            # Region combination
+            patient_emb = self.region_combination(region_flat)  # (batch, d_model)
+
+            # Classification
+            logits = self.classifier(patient_emb)  # (batch, 2)
+
+            return logits
+
+        def get_region_embeddings(
+            self,
+            embeddings: torch.Tensor,
+            positions: torch.Tensor,
+            region_types: torch.Tensor,
+            dosages: torch.Tensor,
+            mask: Optional[torch.Tensor] = None
+        ) -> torch.Tensor:
+            """Get intermediate region embeddings for attribution."""
+            x = embeddings * dosages.unsqueeze(-1)
+            x = self.input_proj(x)
+            pos_emb = self.pos_encoding(positions)
+            x = x + pos_emb
+            region_emb = self.region_attention(x, region_types, mask)
+            return region_emb
+
+    return HierarchicalAISModel(embedding_dim, d_model, n_heads, n_regions, hidden_dim, dropout)
+
+
+def build_baseline_model(embedding_dim: int = 256, hidden_dim: int = 128, dropout: float = 0.3):
+    """Build simple mean-pooling baseline model."""
+    import torch.nn as nn
+
+    class MeanPoolingBaseline(nn.Module):
+        """Baseline: mean pooling + MLP classifier."""
+
+        def __init__(self, embedding_dim, hidden_dim, dropout):
+            super().__init__()
+            self.classifier = nn.Sequential(
+                nn.Linear(embedding_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 64),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(64, 2)
+            )
+
+        def forward(self, embeddings, positions, region_types, dosages, mask=None):
+            # Dosage-weighted mean pooling
+            x = embeddings * dosages.unsqueeze(-1)
             if mask is not None:
-                # Convert to attention mask (True = ignore)
-                attn_mask = ~mask
+                x = x * mask.unsqueeze(-1).float()
+                weights = dosages * mask.float()
             else:
-                attn_mask = None
+                weights = dosages
 
-            h, _ = self.attention(h, h, h, key_padding_mask=attn_mask)
+            # Weighted mean
+            weight_sum = weights.sum(dim=1, keepdim=True).clamp(min=1e-8)
+            pooled = (x * dosages.unsqueeze(-1)).sum(dim=1) / weight_sum.squeeze(-1).unsqueeze(-1).clamp(min=1e-8)
 
-            # Attention pooling
-            pool_weights = self.pool_attention(h).squeeze(-1)  # (batch, n_variants)
-            if mask is not None:
-                pool_weights = pool_weights.masked_fill(~mask, float('-inf'))
-            pool_weights = torch.softmax(pool_weights, dim=-1)
-
-            # Weighted sum
-            pooled = (pool_weights.unsqueeze(-1) * h).sum(dim=1)  # (batch, hidden_dim)
-
-            # Classify
             return self.classifier(pooled)
 
-    input_dim = embedding_dim + vep_dim
-    return AttentionAggregator(input_dim, hidden_dim, n_heads, dropout)
+    return MeanPoolingBaseline(embedding_dim, hidden_dim, dropout)
 
 
 class AISDataset:
-    """Dataset for AIS prediction."""
+    """Dataset for AIS prediction with hierarchical model."""
 
     def __init__(
         self,
-        features: np.ndarray,
+        embeddings: np.ndarray,
+        positions: np.ndarray,
+        region_types: np.ndarray,
+        dosages: np.ndarray,
         labels: np.ndarray,
         sample_ids: List[str] = None
     ):
-        self.features = features
+        self.embeddings = embeddings
+        self.positions = positions
+        self.region_types = region_types
+        self.dosages = dosages
         self.labels = labels
         self.sample_ids = sample_ids
 
@@ -378,285 +446,230 @@ class AISDataset:
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx]
+        return {
+            'embeddings': self.embeddings,  # Shared across samples
+            'positions': self.positions,
+            'region_types': self.region_types,
+            'dosages': self.dosages[idx],
+            'label': self.labels[idx]
+        }
 
 
-def train_sklearn_model(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    model_type: str = 'xgboost'
-) -> Tuple[object, Dict]:
-    """
-    Train a sklearn-compatible model.
-
-    Args:
-        X_train, y_train: Training data
-        X_val, y_val: Validation data
-        model_type: 'xgboost', 'lightgbm', 'rf', or 'logistic'
-
-    Returns:
-        Tuple of (trained_model, metrics_dict)
-    """
-    if model_type == 'xgboost':
-        try:
-            from xgboost import XGBClassifier
-            model = XGBClassifier(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                scale_pos_weight=(y_train == 0).sum() / (y_train == 1).sum(),
-                random_state=42,
-                use_label_encoder=False,
-                eval_metric='auc'
-            )
-        except ImportError:
-            logger.warning("XGBoost not available, falling back to Random Forest")
-            model_type = 'rf'
-
-    if model_type == 'lightgbm':
-        try:
-            from lightgbm import LGBMClassifier
-            model = LGBMClassifier(
-                n_estimators=100,
-                max_depth=6,
-                learning_rate=0.1,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                class_weight='balanced',
-                random_state=42
-            )
-        except ImportError:
-            logger.warning("LightGBM not available, falling back to Random Forest")
-            model_type = 'rf'
-
-    if model_type == 'rf':
-        from sklearn.ensemble import RandomForestClassifier
-        model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
-            class_weight='balanced',
-            random_state=42,
-            n_jobs=-1
-        )
-
-    if model_type == 'logistic':
-        from sklearn.linear_model import LogisticRegression
-        model = LogisticRegression(
-            max_iter=1000,
-            class_weight='balanced',
-            random_state=42
-        )
-
-    # Train
-    logger.info(f"Training {model_type} model...")
-    model.fit(X_train, y_train)
-
-    # Evaluate
-    y_pred_proba = model.predict_proba(X_val)[:, 1]
-    y_pred = (y_pred_proba > 0.5).astype(int)
-
-    metrics = {
-        'auroc': roc_auc_score(y_val, y_pred_proba),
-        'auprc': average_precision_score(y_val, y_pred_proba),
-        'f1': f1_score(y_val, y_pred),
-        'precision': precision_score(y_val, y_pred),
-        'recall': recall_score(y_val, y_pred),
-    }
-
-    logger.info(f"Validation metrics:")
-    for name, value in metrics.items():
-        logger.info(f"  {name}: {value:.4f}")
-
-    return model, metrics
-
-
-def train_pytorch_model(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    model_type: str = 'mlp',
-    epochs: int = 50,
-    batch_size: int = 64,
+def train_model_cv(
+    embeddings: np.ndarray,
+    positions: np.ndarray,
+    region_types: np.ndarray,
+    dosages: np.ndarray,
+    labels: np.ndarray,
+    model_type: str = 'hierarchical',
+    n_folds: int = 5,
+    epochs: int = 100,
+    batch_size: int = 32,
     learning_rate: float = 1e-3,
+    weight_decay: float = 0.1,
+    patience: int = 15,
     device: str = 'auto'
 ) -> Tuple[object, Dict]:
     """
-    Train a PyTorch model.
-
-    Args:
-        X_train, y_train: Training data
-        X_val, y_val: Validation data
-        model_type: 'mlp' or 'attention'
-        epochs: Number of training epochs
-        batch_size: Batch size
-        learning_rate: Learning rate
-        device: 'cuda', 'cpu', or 'auto'
+    Train model with stratified k-fold cross-validation.
 
     Returns:
-        Tuple of (trained_model, metrics_dict)
+        Tuple of (best_model, metrics_dict)
     """
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, TensorDataset
 
-    # Device
     if device == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logger.info(f"Training on device: {device}")
 
     # Convert to tensors
-    X_train_t = torch.FloatTensor(X_train)
-    y_train_t = torch.FloatTensor(y_train)
-    X_val_t = torch.FloatTensor(X_val)
-    y_val_t = torch.FloatTensor(y_val)
-
-    # Data loaders
-    train_dataset = TensorDataset(X_train_t, y_train_t)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-
-    # Build model
-    input_dim = X_train.shape[1]
-    if model_type == 'mlp':
-        model = build_mlp_model(input_dim, [256, 128, 64])
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-
-    model = model.to(device)
-
-    # Loss with class weighting
-    pos_weight = torch.tensor([(y_train == 0).sum() / (y_train == 1).sum()]).to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
-
-    # Training loop
-    best_auroc = 0
-    best_state = None
-    patience_counter = 0
-
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0
-
-        for batch_X, batch_y in train_loader:
-            batch_X = batch_X.to(device)
-            batch_y = batch_y.to(device)
-
-            optimizer.zero_grad()
-            outputs = model(batch_X).squeeze()
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-
-            train_loss += loss.item()
-
-        # Validation
-        model.eval()
-        with torch.no_grad():
-            val_outputs = model(X_val_t.to(device)).squeeze()
-            val_loss = criterion(val_outputs, y_val_t.to(device)).item()
-            val_proba = torch.sigmoid(val_outputs).cpu().numpy()
-
-        val_auroc = roc_auc_score(y_val, val_proba)
-        scheduler.step(val_loss)
-
-        if val_auroc > best_auroc:
-            best_auroc = val_auroc
-            best_state = model.state_dict().copy()
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        if (epoch + 1) % 10 == 0:
-            logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss/len(train_loader):.4f}, "
-                       f"Val Loss: {val_loss:.4f}, Val AUROC: {val_auroc:.4f}")
-
-        if patience_counter >= 10:
-            logger.info(f"Early stopping at epoch {epoch + 1}")
-            break
-
-    # Load best model
-    model.load_state_dict(best_state)
-
-    # Final evaluation
-    model.eval()
-    with torch.no_grad():
-        val_proba = torch.sigmoid(model(X_val_t.to(device)).squeeze()).cpu().numpy()
-
-    y_pred = (val_proba > 0.5).astype(int)
-
-    metrics = {
-        'auroc': roc_auc_score(y_val, val_proba),
-        'auprc': average_precision_score(y_val, val_proba),
-        'f1': f1_score(y_val, y_pred),
-        'precision': precision_score(y_val, y_pred),
-        'recall': recall_score(y_val, y_pred),
-    }
-
-    logger.info(f"Final validation metrics:")
-    for name, value in metrics.items():
-        logger.info(f"  {name}: {value:.4f}")
-
-    return model, metrics
-
-
-def cross_validate(
-    X: np.ndarray,
-    y: np.ndarray,
-    n_folds: int = 5,
-    model_type: str = 'xgboost'
-) -> Dict:
-    """
-    Perform stratified k-fold cross-validation.
-
-    Returns:
-        Dict with mean and std of metrics across folds
-    """
-    logger.info(f"Running {n_folds}-fold cross-validation...")
+    embeddings_t = torch.FloatTensor(embeddings)
+    positions_t = torch.LongTensor(positions)
+    region_types_t = torch.LongTensor(region_types)
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
-    all_metrics = []
+    fold_metrics = []
+    best_model_state = None
+    best_auroc = 0
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
-        logger.info(f"\nFold {fold + 1}/{n_folds}")
+    for fold, (train_idx, val_idx) in enumerate(skf.split(dosages, labels)):
+        logger.info(f"\n{'='*50}")
+        logger.info(f"Fold {fold + 1}/{n_folds}")
+        logger.info(f"{'='*50}")
 
-        X_train, X_val = X[train_idx], X[val_idx]
-        y_train, y_val = y[train_idx], y[val_idx]
+        # Split data
+        train_dosages = torch.FloatTensor(dosages[train_idx])
+        train_labels = torch.FloatTensor(labels[train_idx])
+        val_dosages = torch.FloatTensor(dosages[val_idx])
+        val_labels = torch.FloatTensor(labels[val_idx])
 
-        # Scale features
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_val = scaler.transform(X_val)
+        # Create data loaders
+        train_dataset = TensorDataset(train_dosages, train_labels)
+        val_dataset = TensorDataset(val_dosages, val_labels)
 
-        # Train model
-        if model_type in ['xgboost', 'lightgbm', 'rf', 'logistic']:
-            _, metrics = train_sklearn_model(X_train, y_train, X_val, y_val, model_type)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+        # Build model
+        embedding_dim = embeddings.shape[1]
+        if model_type == 'hierarchical':
+            model = build_hierarchical_model(embedding_dim=embedding_dim)
         else:
-            _, metrics = train_pytorch_model(X_train, y_train, X_val, y_val, model_type)
+            model = build_baseline_model(embedding_dim=embedding_dim)
+        model = model.to(device)
 
-        all_metrics.append(metrics)
+        # Move shared tensors to device
+        emb_device = embeddings_t.to(device)
+        pos_device = positions_t.to(device)
+        reg_device = region_types_t.to(device)
+
+        # Class weights for imbalanced data
+        n_pos = (labels[train_idx] == 1).sum()
+        n_neg = (labels[train_idx] == 0).sum()
+        class_weights = torch.FloatTensor([n_pos / len(train_idx), n_neg / len(train_idx)]).to(device)
+
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+        # Training loop
+        best_fold_auroc = 0
+        best_fold_state = None
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            # Training
+            model.train()
+            train_loss = 0
+
+            for batch_dosages, batch_labels in train_loader:
+                batch_dosages = batch_dosages.to(device)
+                batch_labels = batch_labels.long().to(device)
+
+                # Expand embeddings for batch
+                batch_size_actual = batch_dosages.shape[0]
+                batch_emb = emb_device.unsqueeze(0).expand(batch_size_actual, -1, -1)
+                batch_pos = pos_device.unsqueeze(0).expand(batch_size_actual, -1)
+                batch_reg = reg_device.unsqueeze(0).expand(batch_size_actual, -1)
+
+                optimizer.zero_grad()
+                logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
+                loss = criterion(logits, batch_labels)
+                loss.backward()
+
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                optimizer.step()
+                train_loss += loss.item()
+
+            scheduler.step()
+
+            # Validation
+            model.eval()
+            val_probs = []
+            val_true = []
+
+            with torch.no_grad():
+                for batch_dosages, batch_labels in val_loader:
+                    batch_dosages = batch_dosages.to(device)
+                    batch_size_actual = batch_dosages.shape[0]
+                    batch_emb = emb_device.unsqueeze(0).expand(batch_size_actual, -1, -1)
+                    batch_pos = pos_device.unsqueeze(0).expand(batch_size_actual, -1)
+                    batch_reg = reg_device.unsqueeze(0).expand(batch_size_actual, -1)
+
+                    logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
+                    probs = torch.softmax(logits, dim=-1)[:, 1]
+
+                    val_probs.extend(probs.cpu().numpy())
+                    val_true.extend(batch_labels.numpy())
+
+            val_auroc = roc_auc_score(val_true, val_probs)
+
+            if val_auroc > best_fold_auroc:
+                best_fold_auroc = val_auroc
+                best_fold_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if (epoch + 1) % 10 == 0:
+                logger.info(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss/len(train_loader):.4f}, "
+                           f"Val AUROC: {val_auroc:.4f} (best: {best_fold_auroc:.4f})")
+
+            if patience_counter >= patience:
+                logger.info(f"Early stopping at epoch {epoch + 1}")
+                break
+
+        # Load best model for this fold
+        model.load_state_dict(best_fold_state)
+
+        # Final evaluation on validation set
+        model.eval()
+        val_probs = []
+        val_true = []
+
+        with torch.no_grad():
+            for batch_dosages, batch_labels in val_loader:
+                batch_dosages = batch_dosages.to(device)
+                batch_size_actual = batch_dosages.shape[0]
+                batch_emb = emb_device.unsqueeze(0).expand(batch_size_actual, -1, -1)
+                batch_pos = pos_device.unsqueeze(0).expand(batch_size_actual, -1)
+                batch_reg = reg_device.unsqueeze(0).expand(batch_size_actual, -1)
+
+                logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
+                probs = torch.softmax(logits, dim=-1)[:, 1]
+
+                val_probs.extend(probs.cpu().numpy())
+                val_true.extend(batch_labels.numpy())
+
+        val_probs = np.array(val_probs)
+        val_true = np.array(val_true)
+        val_pred = (val_probs > 0.5).astype(int)
+
+        fold_metric = {
+            'auroc': roc_auc_score(val_true, val_probs),
+            'auprc': average_precision_score(val_true, val_probs),
+            'f1': f1_score(val_true, val_pred),
+            'precision': precision_score(val_true, val_pred, zero_division=0),
+            'recall': recall_score(val_true, val_pred, zero_division=0),
+        }
+        fold_metrics.append(fold_metric)
+
+        logger.info(f"Fold {fold + 1} - AUROC: {fold_metric['auroc']:.4f}, AUPRC: {fold_metric['auprc']:.4f}")
+
+        # Track best model across folds
+        if fold_metric['auroc'] > best_auroc:
+            best_auroc = fold_metric['auroc']
+            best_model_state = best_fold_state
 
     # Aggregate metrics
     aggregated = {}
-    for key in all_metrics[0].keys():
-        values = [m[key] for m in all_metrics]
+    for key in fold_metrics[0].keys():
+        values = [m[key] for m in fold_metrics]
         aggregated[key] = {
-            'mean': np.mean(values),
-            'std': np.std(values)
+            'mean': float(np.mean(values)),
+            'std': float(np.std(values)),
+            'values': values
         }
 
     logger.info(f"\n{'='*50}")
-    logger.info("Cross-validation results:")
+    logger.info("Cross-validation Results:")
+    logger.info(f"{'='*50}")
     for name, stats in aggregated.items():
         logger.info(f"  {name}: {stats['mean']:.4f} ± {stats['std']:.4f}")
 
-    return aggregated
+    # Build final model with best weights
+    if model_type == 'hierarchical':
+        final_model = build_hierarchical_model(embedding_dim=embeddings.shape[1])
+    else:
+        final_model = build_baseline_model(embedding_dim=embeddings.shape[1])
+    final_model.load_state_dict(best_model_state)
+
+    return final_model, aggregated
 
 
 def train_model(args):
@@ -665,237 +678,214 @@ def train_model(args):
     logger.info("Phase 5: AIS Prediction Model Training")
     logger.info("=" * 50)
 
-    # Load data
+    # Load embeddings
     embeddings = load_embeddings(args.embeddings)
-    annotations = load_annotations(args.annotations)
-    dosages, sample_ids, variant_ids = load_dosages(args.dosages)
-    cohort = load_cohort(args.cohort)
 
-    # Encode VEP features
-    vep_features = encode_vep_features(annotations)
-    logger.info(f"VEP feature dimension: {vep_features.shape[1]}")
-
-    # Match samples between dosage matrix and cohort
-    # Find sample ID column in cohort
-    id_cols = ['eid', 'IID', 'sample_id', 'FID']
-    id_col = None
-    for col in id_cols:
-        if col in cohort.columns:
-            id_col = col
-            break
-
-    if id_col is None:
-        logger.warning("No sample ID column found in cohort, assuming order matches")
-        matched_indices = list(range(min(len(sample_ids), len(cohort))))
-        matched_cohort_indices = matched_indices
+    # Use difference embeddings
+    if 'diff' in embeddings:
+        delta_embeddings = embeddings['diff']
+    elif 'alt' in embeddings and 'ref' in embeddings:
+        delta_embeddings = embeddings['alt'] - embeddings['ref']
     else:
-        # Convert sample IDs to strings for matching
+        delta_embeddings = list(embeddings.values())[0]
+
+    logger.info(f"Delta embeddings shape: {delta_embeddings.shape}")
+
+    # Load annotations
+    logger.info(f"Loading annotations from {args.annotations}")
+    annotations = pd.read_parquet(args.annotations)
+    logger.info(f"Loaded {len(annotations)} variants")
+
+    # Get positions and region types
+    positions = annotations['POS'].values if 'POS' in annotations.columns else np.arange(len(annotations))
+
+    # Map consequences to region types
+    if 'most_severe_consequence' in annotations.columns:
+        region_types = np.array([
+            get_region_type(c) for c in annotations['most_severe_consequence']
+        ])
+    elif 'Consequence' in annotations.columns:
+        region_types = np.array([
+            get_region_type(c.split(',')[0]) for c in annotations['Consequence']
+        ])
+    else:
+        logger.warning("No consequence column found, using 'other' for all variants")
+        region_types = np.full(len(annotations), REGION_TYPES.index('other'))
+
+    # Region type distribution
+    logger.info("Region type distribution:")
+    for i, rtype in enumerate(REGION_TYPES):
+        count = (region_types == i).sum()
+        logger.info(f"  {rtype}: {count:,} ({100*count/len(region_types):.1f}%)")
+
+    # Load dosages
+    logger.info(f"Loading dosages from {args.dosages}")
+    dosages_df = pd.read_parquet(args.dosages)
+
+    variant_cols = ['SNP', 'CHR', 'POS', 'A1', 'A2', 'REF', 'ALT', 'variant_id']
+    sample_cols = [c for c in dosages_df.columns if c not in variant_cols]
+    dosages = dosages_df[sample_cols].values.T  # (n_samples, n_variants)
+    sample_ids = sample_cols
+
+    logger.info(f"Dosages shape: {dosages.shape}")
+
+    # Load cohort
+    logger.info(f"Loading cohort from {args.cohort}")
+    cohort = pd.read_parquet(args.cohort)
+
+    label_cols = ['is_case', 'case', 'label', 'AIS', 'phenotype']
+    label_col = next((c for c in label_cols if c in cohort.columns), None)
+    if label_col:
+        cohort['label'] = cohort[label_col].astype(int)
+    else:
+        raise ValueError(f"No label column found. Expected one of: {label_cols}")
+
+    # Match samples
+    id_cols = ['eid', 'IID', 'sample_id', 'FID']
+    id_col = next((c for c in id_cols if c in cohort.columns), None)
+
+    if id_col:
         cohort_ids = set(cohort[id_col].astype(str))
         matched_indices = []
         matched_cohort_indices = []
-
         for i, sid in enumerate(sample_ids):
-            sid_str = str(sid)
-            if sid_str in cohort_ids:
+            if str(sid) in cohort_ids:
                 matched_indices.append(i)
                 matched_cohort_indices.append(
-                    cohort[cohort[id_col].astype(str) == sid_str].index[0]
+                    cohort[cohort[id_col].astype(str) == str(sid)].index[0]
                 )
+    else:
+        matched_indices = list(range(min(len(sample_ids), len(cohort))))
+        matched_cohort_indices = matched_indices
 
-    logger.info(f"Matched {len(matched_indices)} samples between dosages and cohort")
+    logger.info(f"Matched {len(matched_indices)} samples")
 
-    if len(matched_indices) == 0:
-        raise ValueError("No matching samples found between dosage and cohort files!")
-
-    # Create sample features
     matched_dosages = dosages[matched_indices]
-    sample_features = create_sample_features(
-        matched_dosages, embeddings, vep_features, args.aggregation
-    )
-
-    # Get labels
     labels = cohort.iloc[matched_cohort_indices]['label'].values
 
-    logger.info(f"Final dataset: {sample_features.shape[0]} samples, {sample_features.shape[1]} features")
-    logger.info(f"Class distribution: {(labels == 1).sum()} cases, {(labels == 0).sum()} controls")
+    n_cases = (labels == 1).sum()
+    n_controls = (labels == 0).sum()
+    logger.info(f"Cases: {n_cases}, Controls: {n_controls}")
 
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        sample_features, labels, test_size=0.2, stratify=labels, random_state=42
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train, y_train, test_size=0.125, stratify=y_train, random_state=42
-    )
-
-    logger.info(f"Train: {len(y_train)} ({(y_train == 1).sum()} cases)")
-    logger.info(f"Val: {len(y_val)} ({(y_val == 1).sum()} cases)")
-    logger.info(f"Test: {len(y_test)} ({(y_test == 1).sum()} cases)")
-
-    # Scale features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_val_scaled = scaler.transform(X_val)
-    X_test_scaled = scaler.transform(X_test)
+    # Verify dimensions match
+    if delta_embeddings.shape[0] != matched_dosages.shape[1]:
+        logger.error(f"Dimension mismatch: embeddings {delta_embeddings.shape[0]} vs dosages {matched_dosages.shape[1]}")
+        return
 
     # Train model
-    if args.model_type in ['xgboost', 'lightgbm', 'rf', 'logistic']:
-        model, val_metrics = train_sklearn_model(
-            X_train_scaled, y_train, X_val_scaled, y_val, args.model_type
-        )
-    else:
-        model, val_metrics = train_pytorch_model(
-            X_train_scaled, y_train, X_val_scaled, y_val,
-            args.model_type, args.epochs, args.batch_size, args.learning_rate, args.device
-        )
-
-    # Test set evaluation
-    logger.info("\nTest set evaluation:")
-    if args.model_type in ['xgboost', 'lightgbm', 'rf', 'logistic']:
-        y_test_proba = model.predict_proba(X_test_scaled)[:, 1]
-    else:
-        import torch
-        model.eval()
-        with torch.no_grad():
-            device = next(model.parameters()).device
-            X_test_t = torch.FloatTensor(X_test_scaled).to(device)
-            y_test_proba = torch.sigmoid(model(X_test_t).squeeze()).cpu().numpy()
-
-    y_test_pred = (y_test_proba > 0.5).astype(int)
-
-    test_metrics = {
-        'auroc': roc_auc_score(y_test, y_test_proba),
-        'auprc': average_precision_score(y_test, y_test_proba),
-        'f1': f1_score(y_test, y_test_pred),
-        'precision': precision_score(y_test, y_test_pred),
-        'recall': recall_score(y_test, y_test_pred),
-    }
-
-    for name, value in test_metrics.items():
-        logger.info(f"  {name}: {value:.4f}")
-
-    logger.info("\nClassification Report:")
-    logger.info(classification_report(y_test, y_test_pred, target_names=['Control', 'Case']))
-
-    # Cross-validation if requested
-    if args.cross_validate:
-        cv_metrics = cross_validate(sample_features, labels, args.n_folds, args.model_type)
-    else:
-        cv_metrics = None
+    model, cv_metrics = train_model_cv(
+        embeddings=delta_embeddings,
+        positions=positions,
+        region_types=region_types,
+        dosages=matched_dosages,
+        labels=labels,
+        model_type=args.model_type,
+        n_folds=args.n_folds,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
+        device=args.device
+    )
 
     # Save model and results
     output_path = Path(args.output)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Save sklearn model
-    if args.model_type in ['xgboost', 'lightgbm', 'rf', 'logistic']:
-        import joblib
-        joblib.dump(model, output_path / 'model.joblib')
-        joblib.dump(scaler, output_path / 'scaler.joblib')
-        logger.info(f"Saved model to {output_path / 'model.joblib'}")
-    else:
-        import torch
-        torch.save(model.state_dict(), output_path / 'model.pt')
-        import joblib
-        joblib.dump(scaler, output_path / 'scaler.joblib')
-        logger.info(f"Saved model to {output_path / 'model.pt'}")
+    import torch
+    torch.save(model.state_dict(), output_path / 'model.pt')
+    logger.info(f"Saved model to {output_path / 'model.pt'}")
 
-    # Save metrics
-    results = {
+    # Save model config
+    config = {
         'model_type': args.model_type,
-        'aggregation': args.aggregation,
+        'embedding_dim': int(delta_embeddings.shape[1]),
+        'd_model': 64,
+        'n_heads': 2,
+        'n_regions': 8,
+        'hidden_dim': 128,
+        'dropout': 0.3,
+        'n_variants': int(delta_embeddings.shape[0]),
         'n_samples': len(labels),
-        'n_features': sample_features.shape[1],
-        'n_variants': vep_features.shape[0],
-        'embedding_dim': list(embeddings.values())[0].shape[1],
-        'val_metrics': val_metrics,
-        'test_metrics': test_metrics,
+        'n_cases': int(n_cases),
+        'n_controls': int(n_controls),
     }
-    if cv_metrics:
-        results['cv_metrics'] = cv_metrics
+
+    with open(output_path / 'config.json', 'w') as f:
+        json.dump(config, f, indent=2)
+
+    # Save CV metrics
+    results = {
+        'cv_metrics': cv_metrics,
+        'config': config,
+    }
 
     with open(output_path / 'results.json', 'w') as f:
-        json.dump(results, f, indent=2)
+        json.dump(results, f, indent=2, default=float)
 
-    logger.info(f"\nSaved results to {output_path / 'results.json'}")
+    # Save variant metadata for attribution
+    variant_meta = {
+        'positions': positions.tolist(),
+        'region_types': region_types.tolist(),
+        'region_type_names': REGION_TYPES,
+    }
+    with open(output_path / 'variant_metadata.json', 'w') as f:
+        json.dump(variant_meta, f)
 
-    # Summary
+    # Count parameters
+    n_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"\nModel parameters: {n_params:,}")
+
     logger.info("")
     logger.info("=" * 50)
     logger.info("TRAINING COMPLETE")
     logger.info("=" * 50)
     logger.info(f"Model type: {args.model_type}")
-    logger.info(f"Test AUROC: {test_metrics['auroc']:.4f}")
-    logger.info(f"Test AUPRC: {test_metrics['auprc']:.4f}")
-    logger.info(f"Output directory: {output_path}")
+    logger.info(f"Parameters: {n_params:,}")
+    logger.info(f"CV AUROC: {cv_metrics['auroc']['mean']:.4f} ± {cv_metrics['auroc']['std']:.4f}")
+    logger.info(f"CV AUPRC: {cv_metrics['auprc']['mean']:.4f} ± {cv_metrics['auprc']['std']:.4f}")
+    logger.info(f"Output: {output_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train AIS prediction model using HyenaDNA embeddings"
+        description="Train hierarchical attention model for AIS prediction"
     )
 
     # Data inputs
-    parser.add_argument(
-        '--embeddings', required=True,
-        help='Path prefix to HyenaDNA embeddings (e.g., data/embeddings/variant_embeddings)'
-    )
-    parser.add_argument(
-        '--annotations', required=True,
-        help='Path to VEP-annotated variants parquet file'
-    )
-    parser.add_argument(
-        '--dosages', required=True,
-        help='Path to genotype dosages parquet file'
-    )
-    parser.add_argument(
-        '--cohort', required=True,
-        help='Path to cohort definition parquet file with case/control labels'
-    )
-    parser.add_argument(
-        '--output', '-o', required=True,
-        help='Output directory for model and results'
-    )
+    parser.add_argument('--embeddings', required=True,
+                       help='Path prefix to HyenaDNA embeddings')
+    parser.add_argument('--annotations', required=True,
+                       help='Path to VEP-annotated variants parquet file')
+    parser.add_argument('--dosages', required=True,
+                       help='Path to genotype dosages parquet file')
+    parser.add_argument('--cohort', required=True,
+                       help='Path to cohort definition parquet file')
+    parser.add_argument('--output', '-o', required=True,
+                       help='Output directory for model and results')
 
     # Model configuration
-    parser.add_argument(
-        '--model-type', default='xgboost',
-        choices=['xgboost', 'lightgbm', 'rf', 'logistic', 'mlp'],
-        help='Model type to train (default: xgboost)'
-    )
-    parser.add_argument(
-        '--aggregation', default='weighted',
-        choices=['weighted', 'mean', 'presence'],
-        help='How to aggregate variant features per sample (default: weighted)'
-    )
+    parser.add_argument('--model-type', default='hierarchical',
+                       choices=['hierarchical', 'baseline'],
+                       help='Model type (default: hierarchical)')
 
-    # Training parameters (for neural models)
-    parser.add_argument(
-        '--epochs', type=int, default=50,
-        help='Number of training epochs for neural models (default: 50)'
-    )
-    parser.add_argument(
-        '--batch-size', type=int, default=64,
-        help='Batch size for neural models (default: 64)'
-    )
-    parser.add_argument(
-        '--learning-rate', type=float, default=1e-3,
-        help='Learning rate for neural models (default: 1e-3)'
-    )
-    parser.add_argument(
-        '--device', default='auto',
-        choices=['auto', 'cuda', 'cpu'],
-        help='Device for neural models (default: auto)'
-    )
-
-    # Cross-validation
-    parser.add_argument(
-        '--cross-validate', action='store_true',
-        help='Perform k-fold cross-validation'
-    )
-    parser.add_argument(
-        '--n-folds', type=int, default=5,
-        help='Number of folds for cross-validation (default: 5)'
-    )
+    # Training parameters
+    parser.add_argument('--n-folds', type=int, default=5,
+                       help='Number of CV folds (default: 5)')
+    parser.add_argument('--epochs', type=int, default=100,
+                       help='Max training epochs (default: 100)')
+    parser.add_argument('--batch-size', type=int, default=32,
+                       help='Batch size (default: 32)')
+    parser.add_argument('--learning-rate', type=float, default=1e-3,
+                       help='Learning rate (default: 1e-3)')
+    parser.add_argument('--weight-decay', type=float, default=0.1,
+                       help='Weight decay (default: 0.1)')
+    parser.add_argument('--patience', type=int, default=15,
+                       help='Early stopping patience (default: 15)')
+    parser.add_argument('--device', default='auto',
+                       choices=['auto', 'cuda', 'cpu'],
+                       help='Device (default: auto)')
 
     args = parser.parse_args()
     train_model(args)
