@@ -335,12 +335,12 @@ def convert_raw(args):
 
 
 def convert_raw_chunked(args):
-    """Convert large PLINK2 .raw export using line-by-line reading (fast)."""
+    """Convert large PLINK2 .raw export using optimized batched reading."""
     raw_path = Path(args.raw)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Loading PLINK2 export from {raw_path} (fast line-by-line mode)")
+    logger.info(f"Loading PLINK2 export from {raw_path} (optimized batched mode)")
 
     # Read header first
     with open(raw_path, 'r') as f:
@@ -352,10 +352,10 @@ def convert_raw_chunked(args):
 
     logger.info(f"Found {n_variants} variants")
 
-    # Count lines
+    # Count lines efficiently
     logger.info("Counting samples...")
-    with open(raw_path, 'r') as f:
-        n_samples = sum(1 for _ in f) - 1  # Subtract header
+    with open(raw_path, 'rb') as f:
+        n_samples = sum(1 for _ in f) - 1  # Subtract header (binary mode is faster)
 
     logger.info(f"Found {n_samples} samples")
 
@@ -367,39 +367,49 @@ def convert_raw_chunked(args):
             str(zarr_path),
             mode='w',
             shape=(n_samples, n_variants),
-            chunks=(min(100, n_samples), min(10000, n_variants)),
+            chunks=(min(500, n_samples), min(50000, n_variants)),  # Larger chunks for efficiency
             dtype='float32'
         )
     except ImportError:
         logger.error("zarr is required for chunked mode. Install with: pip install zarr")
         return
 
-    # Read line by line with numpy optimization (much faster)
+    # Batch size for zarr writes (KEY OPTIMIZATION: batch writes instead of per-row)
+    BATCH_SIZE = 500
     sample_ids = []
+    batch_dosages = []
+    batch_start = 0
 
-    logger.info(f"Reading {n_samples} samples with numpy optimization...")
+    logger.info(f"Reading samples in batches of {BATCH_SIZE}...")
 
     with open(raw_path, 'r') as f:
         # Skip header
         f.readline()
 
         for i, line in enumerate(f):
-            # Split only first 6 fields to get metadata, keep rest as one string
+            # Split only first 6 fields to get metadata
             parts = line.split(maxsplit=6)
-
-            # First 6 columns are metadata: FID IID PAT MAT SEX PHENOTYPE
             sample_ids.append(parts[1])  # IID
 
-            # Parse dosages using numpy (much faster than Python loop)
+            # Parse dosages using numpy
             dosage_str = parts[6].replace('NA', 'nan')
             dosages = np.fromstring(dosage_str, sep=' ', dtype=np.float32)
+            batch_dosages.append(dosages)
 
-            # Write to zarr
-            zarr_array[i, :] = dosages
+            # Write batch to zarr when full
+            if len(batch_dosages) >= BATCH_SIZE:
+                batch_array = np.vstack(batch_dosages)
+                zarr_array[batch_start:batch_start + len(batch_dosages), :] = batch_array
+                batch_start += len(batch_dosages)
+                batch_dosages = []
 
-            # Progress every 500 samples
-            if (i + 1) % 500 == 0:
-                logger.info(f"Processed {i + 1:,}/{n_samples:,} samples ({100*(i+1)/n_samples:.1f}%)")
+                logger.info(f"Processed {batch_start:,}/{n_samples:,} samples ({100*batch_start/n_samples:.1f}%)")
+
+        # Write remaining samples
+        if batch_dosages:
+            batch_array = np.vstack(batch_dosages)
+            zarr_array[batch_start:batch_start + len(batch_dosages), :] = batch_array
+            logger.info(f"Processed {n_samples:,}/{n_samples:,} samples (100.0%)")
 
     logger.info(f"Loaded {len(sample_ids)} samples")
 
