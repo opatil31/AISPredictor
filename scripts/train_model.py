@@ -195,23 +195,40 @@ def read_zarr_v3_array(zarr_path: Path) -> np.ndarray:
                 # Convert to numpy array
                 chunk_data = np.frombuffer(raw_data, dtype=np_dtype)
 
-                # Calculate chunk shape (may be smaller at edges)
+                # Zarr stores chunks at full chunk size, even for edge chunks
+                # First reshape to full chunk size, then slice for edges
                 if len(shape) == 1:
+                    # Reshape to full chunk size
+                    chunk_data = chunk_data.reshape((chunks[0],))
+
+                    # Calculate what portion of the array this chunk fills
                     start_i = i * chunks[0]
                     end_i = min(start_i + chunks[0], shape[0])
-                    chunk_shape = (end_i - start_i,)
-                    slices = (slice(start_i, end_i),)
+                    actual_size = end_i - start_i
+
+                    # Slice if edge chunk
+                    if actual_size < chunks[0]:
+                        chunk_data = chunk_data[:actual_size]
+
+                    result[start_i:end_i] = chunk_data
                 else:
+                    # Reshape to full chunk size
+                    chunk_data = chunk_data.reshape((chunks[0], chunks[1]))
+
+                    # Calculate what portion of the array this chunk fills
                     start_i = i * chunks[0]
                     end_i = min(start_i + chunks[0], shape[0])
                     start_j = j * chunks[1]
                     end_j = min(start_j + chunks[1], shape[1])
-                    chunk_shape = (end_i - start_i, end_j - start_j)
-                    slices = (slice(start_i, end_i), slice(start_j, end_j))
 
-                # Reshape and insert
-                chunk_data = chunk_data.reshape(chunk_shape)
-                result[slices] = chunk_data
+                    actual_rows = end_i - start_i
+                    actual_cols = end_j - start_j
+
+                    # Slice if edge chunk
+                    chunk_slice = chunk_data[:actual_rows, :actual_cols]
+
+                    result[start_i:end_i, start_j:end_j] = chunk_slice
+
                 chunks_read += 1
 
                 if chunks_read % 50 == 0:
