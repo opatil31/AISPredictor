@@ -765,22 +765,46 @@ def train_model(args):
     dosages_path = Path(args.dosages).resolve()  # Get absolute path
     logger.info(f"Resolved path: {dosages_path}")
 
-    # Check if it's a zarr store (folder with .zarray, .zgroup, or .zattrs)
-    is_zarr = (
-        str(args.dosages).endswith('.zarr') or
-        (dosages_path.is_dir() and (
-            (dosages_path / '.zarray').exists() or
-            (dosages_path / '.zgroup').exists() or
-            (dosages_path / '.zattrs').exists()
-        ))
-    )
+    def find_zarr_store(path: Path) -> Path:
+        """Find the actual zarr store, handling nested structures."""
+        # Check if this path itself is a zarr store
+        zarr_indicators = ['.zarray', '.zgroup', '.zattrs', 'zarr.json']
+        for indicator in zarr_indicators:
+            if (path / indicator).exists():
+                return path
+
+        # Check for nested zarr store with same name (dosages.zarr/dosages.zarr/)
+        if path.is_dir():
+            nested = path / path.name
+            if nested.is_dir():
+                for indicator in zarr_indicators:
+                    if (nested / indicator).exists():
+                        logger.info(f"Found nested zarr store at: {nested}")
+                        return nested
+
+            # Check for any .zarr subdirectory
+            for subdir in path.iterdir():
+                if subdir.is_dir() and subdir.suffix == '.zarr':
+                    for indicator in zarr_indicators:
+                        if (subdir / indicator).exists():
+                            logger.info(f"Found zarr store in subdirectory: {subdir}")
+                            return subdir
+
+        return path
+
+    # Check if it's a zarr store
+    is_zarr = str(args.dosages).endswith('.zarr') or dosages_path.is_dir()
 
     if is_zarr:
         # Zarr format: (n_samples, n_variants) array
         try:
             import zarr
-            logger.info(f"Opening zarr store at: {dosages_path}")
-            store = zarr.open(str(dosages_path), mode='r')
+
+            # Find the actual zarr store (handles nested structures)
+            actual_zarr_path = find_zarr_store(dosages_path)
+            logger.info(f"Opening zarr store at: {actual_zarr_path}")
+
+            store = zarr.open(str(actual_zarr_path), mode='r')
 
             # Handle both array and group formats
             if isinstance(store, zarr.Array):
@@ -804,14 +828,22 @@ def train_model(args):
 
             logger.info(f"Loaded zarr dosages: {dosages.shape}")
 
-            # Try to load sample IDs from accompanying file
-            sample_ids_path = dosages_path.parent / 'sample_ids.txt'
-            if not sample_ids_path.exists():
-                sample_ids_path = Path(str(dosages_path).replace('.zarr', '_sample_ids.txt'))
-            if not sample_ids_path.exists():
-                sample_ids_path = Path(str(dosages_path).replace('.zarr', '.sample_ids.txt'))
+            # Try to load sample IDs from accompanying file (check multiple locations)
+            sample_id_candidates = [
+                dosages_path / 'sample_ids.txt',           # Inside the folder
+                dosages_path.parent / 'sample_ids.txt',    # Next to the folder
+                actual_zarr_path.parent / 'sample_ids.txt',  # Next to actual zarr
+                Path(str(dosages_path).replace('.zarr', '_sample_ids.txt')),
+                Path(str(dosages_path).replace('.zarr', '.sample_ids.txt')),
+            ]
 
-            if sample_ids_path.exists():
+            sample_ids_path = None
+            for candidate in sample_id_candidates:
+                if candidate.exists():
+                    sample_ids_path = candidate
+                    break
+
+            if sample_ids_path:
                 with open(sample_ids_path, 'r') as f:
                     sample_ids = [line.strip() for line in f if line.strip()]
                 logger.info(f"Loaded {len(sample_ids)} sample IDs from {sample_ids_path}")
