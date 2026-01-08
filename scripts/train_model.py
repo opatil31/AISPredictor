@@ -802,27 +802,68 @@ def train_model(args):
 
             # Find the actual zarr store (handles nested structures)
             actual_zarr_path = find_zarr_store(dosages_path)
-            logger.info(f"Opening zarr store at: {actual_zarr_path}")
+            zarr_path_str = str(actual_zarr_path)
+            logger.info(f"Opening zarr store at: {zarr_path_str}")
+            logger.info(f"Path exists: {actual_zarr_path.exists()}")
+            logger.info(f"Path contents: {list(actual_zarr_path.iterdir()) if actual_zarr_path.is_dir() else 'not a dir'}")
 
-            store = zarr.open(str(actual_zarr_path), mode='r')
+            # Try different methods to open the zarr store
+            store = None
+            dosages = None
+
+            # Method 1: Try zarr.open with explicit path string
+            try:
+                store = zarr.open(zarr_path_str, mode='r')
+                logger.info(f"Opened with zarr.open, type: {type(store)}")
+            except Exception as e1:
+                logger.warning(f"zarr.open failed: {e1}")
+
+                # Method 2: Try using LocalStore (zarr v3)
+                try:
+                    from zarr.storage import LocalStore
+                    local_store = LocalStore(zarr_path_str)
+                    store = zarr.open(store=local_store, mode='r')
+                    logger.info(f"Opened with LocalStore, type: {type(store)}")
+                except Exception as e2:
+                    logger.warning(f"LocalStore failed: {e2}")
+
+                    # Method 3: Try zarr.open_array directly
+                    try:
+                        store = zarr.open_array(zarr_path_str, mode='r')
+                        logger.info(f"Opened with zarr.open_array, type: {type(store)}")
+                    except Exception as e3:
+                        logger.warning(f"zarr.open_array failed: {e3}")
+
+                        # Method 4: Try DirectoryStore (zarr v2)
+                        try:
+                            from zarr.storage import DirectoryStore
+                            dir_store = DirectoryStore(zarr_path_str)
+                            store = zarr.open(store=dir_store, mode='r')
+                            logger.info(f"Opened with DirectoryStore, type: {type(store)}")
+                        except Exception as e4:
+                            raise ValueError(f"Could not open zarr store. Tried multiple methods:\n"
+                                           f"  zarr.open: {e1}\n"
+                                           f"  LocalStore: {e2}\n"
+                                           f"  open_array: {e3}\n"
+                                           f"  DirectoryStore: {e4}")
 
             # Handle both array and group formats
             if isinstance(store, zarr.Array):
                 dosages = np.array(store)
-            elif isinstance(store, zarr.Group):
+            elif hasattr(store, 'keys'):  # Group-like
                 # If it's a group, look for the dosage array inside
+                keys = list(store.keys())
+                logger.info(f"Zarr group keys: {keys}")
                 if 'dosages' in store:
                     dosages = np.array(store['dosages'])
                 elif 'data' in store:
                     dosages = np.array(store['data'])
+                elif len(keys) > 0:
+                    # Use the first key
+                    logger.info(f"Using first key: {keys[0]}")
+                    dosages = np.array(store[keys[0]])
                 else:
-                    # Use the first array in the group
-                    arrays = [k for k in store.keys() if isinstance(store[k], zarr.Array)]
-                    if arrays:
-                        logger.info(f"Found arrays in zarr group: {arrays}")
-                        dosages = np.array(store[arrays[0]])
-                    else:
-                        raise ValueError(f"No arrays found in zarr group. Keys: {list(store.keys())}")
+                    raise ValueError(f"No arrays found in zarr group. Keys: {keys}")
             else:
                 dosages = np.array(store)
 
