@@ -79,6 +79,7 @@ def read_zarr_v3_array(zarr_path: Path) -> np.ndarray:
 
     Zarr v3 uses zarr.json for metadata and stores chunks in subdirectories.
     This function provides compatibility when zarr library is v2.
+    Handles zstd compression which is common in zarr v3.
     """
     import json
 
@@ -95,6 +96,17 @@ def read_zarr_v3_array(zarr_path: Path) -> np.ndarray:
     shape = metadata.get('shape', [])
     chunks = metadata.get('chunk_grid', {}).get('configuration', {}).get('chunk_shape', shape)
     dtype_info = metadata.get('data_type', 'float32')
+    codecs = metadata.get('codecs', [])
+
+    # Check for compression
+    compression = None
+    for codec in codecs:
+        codec_name = codec.get('name', '')
+        if codec_name in ['zstd', 'gzip', 'blosc', 'lz4']:
+            compression = codec_name
+            break
+
+    logger.info(f"Compression: {compression}")
 
     # Handle dtype
     if isinstance(dtype_info, dict):
@@ -116,56 +128,104 @@ def read_zarr_v3_array(zarr_path: Path) -> np.ndarray:
 
     logger.info(f"Zarr v3 array: shape={shape}, chunks={chunks}, dtype={dtype}")
 
+    # Setup decompressor
+    decompress = None
+    if compression == 'zstd':
+        try:
+            import zstandard
+            dctx = zstandard.ZstdDecompressor()
+            decompress = lambda data: dctx.decompress(data)
+            logger.info("Using zstandard decompression")
+        except ImportError:
+            try:
+                import zstd
+                decompress = lambda data: zstd.decompress(data)
+                logger.info("Using zstd decompression")
+            except ImportError:
+                raise ImportError("zstd compression requires 'zstandard' package. Install with: pip install zstandard")
+    elif compression == 'gzip':
+        import gzip
+        decompress = lambda data: gzip.decompress(data)
+        logger.info("Using gzip decompression")
+    elif compression == 'lz4':
+        try:
+            import lz4.frame
+            decompress = lambda data: lz4.frame.decompress(data)
+            logger.info("Using lz4 decompression")
+        except ImportError:
+            raise ImportError("lz4 compression requires 'lz4' package. Install with: pip install lz4")
+
     # Initialize output array
     result = np.zeros(shape, dtype=np_dtype)
 
     # Find chunk directory (usually 'c' for zarr v3)
     chunk_dir = zarr_path / 'c'
     if not chunk_dir.exists():
-        # Try looking for numbered directories directly
         chunk_dir = zarr_path
 
-    # Calculate chunk layout
-    n_chunks = [int(np.ceil(s / c)) for s, c in zip(shape, chunks)]
+    logger.info(f"Looking for chunks in: {chunk_dir}")
 
-    # Read chunks
+    # Calculate expected number of chunks
+    n_chunks_per_dim = [int(np.ceil(s / c)) for s, c in zip(shape, chunks)]
+    total_expected = int(np.prod(n_chunks_per_dim))
+    logger.info(f"Expected chunks: {n_chunks_per_dim} = {total_expected} total")
+
+    # Read chunks by iterating through expected indices
     chunks_read = 0
-    for chunk_file in chunk_dir.rglob('*'):
-        if chunk_file.is_file() and chunk_file.suffix == '':
+    for i in range(n_chunks_per_dim[0]):
+        for j in range(n_chunks_per_dim[1]) if len(shape) > 1 else [0]:
+            # Build chunk path
+            if len(shape) == 1:
+                chunk_path = chunk_dir / str(i)
+            else:
+                chunk_path = chunk_dir / str(i) / str(j)
+
+            if not chunk_path.exists():
+                continue
+
             try:
-                # Parse chunk indices from path (e.g., 'c/0/0' or '0/0')
-                rel_path = chunk_file.relative_to(chunk_dir)
-                parts = str(rel_path).split('/')
-                chunk_idx = tuple(int(p) for p in parts if p.isdigit())
+                # Read raw bytes
+                with open(chunk_path, 'rb') as f:
+                    raw_data = f.read()
 
-                if len(chunk_idx) != len(shape):
-                    continue
+                # Decompress if needed
+                if decompress:
+                    raw_data = decompress(raw_data)
 
-                # Read chunk data
-                chunk_data = np.fromfile(chunk_file, dtype=np_dtype)
+                # Convert to numpy array
+                chunk_data = np.frombuffer(raw_data, dtype=np_dtype)
 
                 # Calculate chunk shape (may be smaller at edges)
-                chunk_shape = []
-                slices = []
-                for i, (idx, c, s) in enumerate(zip(chunk_idx, chunks, shape)):
-                    start = idx * c
-                    end = min(start + c, s)
-                    chunk_shape.append(end - start)
-                    slices.append(slice(start, end))
+                if len(shape) == 1:
+                    start_i = i * chunks[0]
+                    end_i = min(start_i + chunks[0], shape[0])
+                    chunk_shape = (end_i - start_i,)
+                    slices = (slice(start_i, end_i),)
+                else:
+                    start_i = i * chunks[0]
+                    end_i = min(start_i + chunks[0], shape[0])
+                    start_j = j * chunks[1]
+                    end_j = min(start_j + chunks[1], shape[1])
+                    chunk_shape = (end_i - start_i, end_j - start_j)
+                    slices = (slice(start_i, end_i), slice(start_j, end_j))
 
                 # Reshape and insert
                 chunk_data = chunk_data.reshape(chunk_shape)
-                result[tuple(slices)] = chunk_data
+                result[slices] = chunk_data
                 chunks_read += 1
 
+                if chunks_read % 50 == 0:
+                    logger.info(f"Read {chunks_read}/{total_expected} chunks...")
+
             except Exception as e:
-                logger.debug(f"Skipping {chunk_file}: {e}")
+                logger.warning(f"Error reading chunk {chunk_path}: {e}")
                 continue
 
-    logger.info(f"Read {chunks_read} chunks from zarr v3 store")
+    logger.info(f"Read {chunks_read}/{total_expected} chunks from zarr v3 store")
 
     if chunks_read == 0:
-        raise ValueError(f"No chunks could be read from {zarr_path}")
+        raise ValueError(f"No chunks could be read from {zarr_path}. "
+                        f"Install zstandard if using zstd compression: pip install zstandard")
 
     return result
 
