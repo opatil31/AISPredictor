@@ -73,6 +73,103 @@ REGION_TYPE_MAP = {
 }
 
 
+def read_zarr_v3_array(zarr_path: Path) -> np.ndarray:
+    """
+    Read a zarr v3 format array manually.
+
+    Zarr v3 uses zarr.json for metadata and stores chunks in subdirectories.
+    This function provides compatibility when zarr library is v2.
+    """
+    import json
+
+    zarr_json_path = zarr_path / 'zarr.json'
+    if not zarr_json_path.exists():
+        raise FileNotFoundError(f"zarr.json not found at {zarr_path}")
+
+    with open(zarr_json_path, 'r') as f:
+        metadata = json.load(f)
+
+    logger.info(f"Zarr v3 metadata: {json.dumps(metadata, indent=2)[:500]}...")
+
+    # Extract array metadata
+    shape = metadata.get('shape', [])
+    chunks = metadata.get('chunk_grid', {}).get('configuration', {}).get('chunk_shape', shape)
+    dtype_info = metadata.get('data_type', 'float32')
+
+    # Handle dtype
+    if isinstance(dtype_info, dict):
+        dtype = dtype_info.get('name', 'float32')
+    else:
+        dtype = str(dtype_info)
+
+    # Map zarr dtype names to numpy
+    dtype_map = {
+        'float32': np.float32,
+        'float64': np.float64,
+        'int32': np.int32,
+        'int64': np.int64,
+        'int8': np.int8,
+        'uint8': np.uint8,
+        'bool': bool,
+    }
+    np_dtype = dtype_map.get(dtype, np.float32)
+
+    logger.info(f"Zarr v3 array: shape={shape}, chunks={chunks}, dtype={dtype}")
+
+    # Initialize output array
+    result = np.zeros(shape, dtype=np_dtype)
+
+    # Find chunk directory (usually 'c' for zarr v3)
+    chunk_dir = zarr_path / 'c'
+    if not chunk_dir.exists():
+        # Try looking for numbered directories directly
+        chunk_dir = zarr_path
+
+    # Calculate chunk layout
+    n_chunks = [int(np.ceil(s / c)) for s, c in zip(shape, chunks)]
+
+    # Read chunks
+    chunks_read = 0
+    for chunk_file in chunk_dir.rglob('*'):
+        if chunk_file.is_file() and chunk_file.suffix == '':
+            try:
+                # Parse chunk indices from path (e.g., 'c/0/0' or '0/0')
+                rel_path = chunk_file.relative_to(chunk_dir)
+                parts = str(rel_path).split('/')
+                chunk_idx = tuple(int(p) for p in parts if p.isdigit())
+
+                if len(chunk_idx) != len(shape):
+                    continue
+
+                # Read chunk data
+                chunk_data = np.fromfile(chunk_file, dtype=np_dtype)
+
+                # Calculate chunk shape (may be smaller at edges)
+                chunk_shape = []
+                slices = []
+                for i, (idx, c, s) in enumerate(zip(chunk_idx, chunks, shape)):
+                    start = idx * c
+                    end = min(start + c, s)
+                    chunk_shape.append(end - start)
+                    slices.append(slice(start, end))
+
+                # Reshape and insert
+                chunk_data = chunk_data.reshape(chunk_shape)
+                result[tuple(slices)] = chunk_data
+                chunks_read += 1
+
+            except Exception as e:
+                logger.debug(f"Skipping {chunk_file}: {e}")
+                continue
+
+    logger.info(f"Read {chunks_read} chunks from zarr v3 store")
+
+    if chunks_read == 0:
+        raise ValueError(f"No chunks could be read from {zarr_path}")
+
+    return result
+
+
 def load_embeddings(embeddings_path: str) -> Dict[str, np.ndarray]:
     """Load HyenaDNA embeddings from zarr or numpy files."""
     embeddings_path = Path(embeddings_path)
@@ -807,67 +904,68 @@ def train_model(args):
             logger.info(f"Path exists: {actual_zarr_path.exists()}")
             logger.info(f"Path contents: {list(actual_zarr_path.iterdir()) if actual_zarr_path.is_dir() else 'not a dir'}")
 
-            # Try different methods to open the zarr store
-            store = None
-            dosages = None
+            # Check for zarr v3 format (zarr.json instead of .zarray)
+            zarr_json_path = actual_zarr_path / 'zarr.json'
+            is_zarr_v3 = zarr_json_path.exists()
 
-            # Method 1: Try zarr.open with explicit path string
-            try:
-                store = zarr.open(zarr_path_str, mode='r')
-                logger.info(f"Opened with zarr.open, type: {type(store)}")
-            except Exception as e1:
-                logger.warning(f"zarr.open failed: {e1}")
+            if is_zarr_v3:
+                logger.info("Detected zarr v3 format (zarr.json found)")
+                # Try to read zarr v3 format manually
+                dosages = read_zarr_v3_array(actual_zarr_path)
+                logger.info(f"Loaded zarr v3 dosages: {dosages.shape}")
+            else:
+                # Try different methods to open zarr v2 store
+                store = None
+                dosages = None
 
-                # Method 2: Try using LocalStore (zarr v3)
+                # Method 1: Try zarr.open with explicit path string
                 try:
-                    from zarr.storage import LocalStore
-                    local_store = LocalStore(zarr_path_str)
-                    store = zarr.open(store=local_store, mode='r')
-                    logger.info(f"Opened with LocalStore, type: {type(store)}")
-                except Exception as e2:
-                    logger.warning(f"LocalStore failed: {e2}")
+                    store = zarr.open(zarr_path_str, mode='r')
+                    logger.info(f"Opened with zarr.open, type: {type(store)}")
+                except Exception as e1:
+                    logger.warning(f"zarr.open failed: {e1}")
 
-                    # Method 3: Try zarr.open_array directly
+                    # Method 2: Try DirectoryStore (zarr v2)
                     try:
-                        store = zarr.open_array(zarr_path_str, mode='r')
-                        logger.info(f"Opened with zarr.open_array, type: {type(store)}")
-                    except Exception as e3:
-                        logger.warning(f"zarr.open_array failed: {e3}")
+                        from zarr.storage import DirectoryStore
+                        dir_store = DirectoryStore(zarr_path_str)
+                        store = zarr.open(store=dir_store, mode='r')
+                        logger.info(f"Opened with DirectoryStore, type: {type(store)}")
+                    except Exception as e2:
+                        logger.warning(f"DirectoryStore failed: {e2}")
 
-                        # Method 4: Try DirectoryStore (zarr v2)
+                        # Method 3: Try zarr.open_array directly
                         try:
-                            from zarr.storage import DirectoryStore
-                            dir_store = DirectoryStore(zarr_path_str)
-                            store = zarr.open(store=dir_store, mode='r')
-                            logger.info(f"Opened with DirectoryStore, type: {type(store)}")
-                        except Exception as e4:
+                            store = zarr.open_array(zarr_path_str, mode='r')
+                            logger.info(f"Opened with zarr.open_array, type: {type(store)}")
+                        except Exception as e3:
                             raise ValueError(f"Could not open zarr store. Tried multiple methods:\n"
                                            f"  zarr.open: {e1}\n"
-                                           f"  LocalStore: {e2}\n"
+                                           f"  DirectoryStore: {e2}\n"
                                            f"  open_array: {e3}\n"
-                                           f"  DirectoryStore: {e4}")
+                                           f"\nIf using zarr v3 format, ensure zarr.json exists or upgrade zarr: pip install 'zarr>=3.0'")
 
-            # Handle both array and group formats
-            if isinstance(store, zarr.Array):
-                dosages = np.array(store)
-            elif hasattr(store, 'keys'):  # Group-like
-                # If it's a group, look for the dosage array inside
-                keys = list(store.keys())
-                logger.info(f"Zarr group keys: {keys}")
-                if 'dosages' in store:
-                    dosages = np.array(store['dosages'])
-                elif 'data' in store:
-                    dosages = np.array(store['data'])
-                elif len(keys) > 0:
-                    # Use the first key
-                    logger.info(f"Using first key: {keys[0]}")
-                    dosages = np.array(store[keys[0]])
+                # Handle both array and group formats
+                if isinstance(store, zarr.Array):
+                    dosages = np.array(store)
+                elif hasattr(store, 'keys'):  # Group-like
+                    # If it's a group, look for the dosage array inside
+                    keys = list(store.keys())
+                    logger.info(f"Zarr group keys: {keys}")
+                    if 'dosages' in store:
+                        dosages = np.array(store['dosages'])
+                    elif 'data' in store:
+                        dosages = np.array(store['data'])
+                    elif len(keys) > 0:
+                        # Use the first key
+                        logger.info(f"Using first key: {keys[0]}")
+                        dosages = np.array(store[keys[0]])
+                    else:
+                        raise ValueError(f"No arrays found in zarr group. Keys: {keys}")
                 else:
-                    raise ValueError(f"No arrays found in zarr group. Keys: {keys}")
-            else:
-                dosages = np.array(store)
+                    dosages = np.array(store)
 
-            logger.info(f"Loaded zarr dosages: {dosages.shape}")
+                logger.info(f"Loaded zarr v2 dosages: {dosages.shape}")
 
             # Try to load sample IDs from accompanying file (check multiple locations)
             sample_id_candidates = [
