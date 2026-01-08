@@ -1078,6 +1078,116 @@ def train_model(args):
 
     logger.info(f"Dosages shape: {dosages.shape}")
 
+    # ========== VARIANT SUBSETTING ==========
+    # The dosage matrix may contain all variants (e.g., 546k) while we only have
+    # embeddings for filtered variants (e.g., 92k). We need to subset the dosage
+    # matrix to match the variants in our annotations.
+
+    n_dosage_variants = dosages.shape[1]
+    n_annotation_variants = len(annotations)
+
+    if n_dosage_variants != n_annotation_variants:
+        logger.info(f"Variant count mismatch: dosages has {n_dosage_variants}, annotations has {n_annotation_variants}")
+        logger.info("Attempting to subset dosage matrix to match annotations...")
+
+        # Try to load variant IDs for the dosage matrix
+        variant_ids_dosage = None
+
+        if is_zarr:
+            # Look for variant_ids.txt file
+            variant_id_candidates = [
+                actual_zarr_path / 'variant_ids.txt',
+                actual_zarr_path.parent / 'variant_ids.txt',
+                dosages_path / 'variant_ids.txt',
+                dosages_path.parent / 'variant_ids.txt',
+                Path(str(dosages_path).replace('.zarr', '_variant_ids.txt')),
+                Path(str(dosages_path).replace('.zarr', '.variant_ids.txt')),
+            ]
+
+            for candidate in variant_id_candidates:
+                if candidate.exists():
+                    with open(candidate, 'r') as f:
+                        variant_ids_dosage = [line.strip() for line in f if line.strip()]
+                    logger.info(f"Loaded {len(variant_ids_dosage)} variant IDs from {candidate}")
+                    break
+
+        # Construct variant IDs from annotations (chr:pos:ref:alt format)
+        def make_variant_id(row):
+            chrom = str(row.get('CHR', row.get('CHROM', row.get('#CHROM', ''))))
+            pos = str(row.get('POS', ''))
+            ref = str(row.get('REF', row.get('A2', '')))
+            alt = str(row.get('ALT', row.get('A1', '')))
+            return f"{chrom}:{pos}:{ref}:{alt}"
+
+        annotation_variant_ids = annotations.apply(make_variant_id, axis=1).tolist()
+        logger.info(f"Constructed {len(annotation_variant_ids)} variant IDs from annotations")
+        logger.info(f"Sample annotation variant IDs: {annotation_variant_ids[:3]}")
+
+        if variant_ids_dosage is not None:
+            # Match by variant ID
+            logger.info(f"Sample dosage variant IDs: {variant_ids_dosage[:3]}")
+
+            # Create mapping from dosage variant ID to column index
+            dosage_id_to_idx = {vid: idx for idx, vid in enumerate(variant_ids_dosage)}
+
+            # Find matching indices
+            matched_variant_indices = []
+            unmatched_count = 0
+            for ann_id in annotation_variant_ids:
+                if ann_id in dosage_id_to_idx:
+                    matched_variant_indices.append(dosage_id_to_idx[ann_id])
+                else:
+                    # Try alternative formats (with/without chr prefix)
+                    alt_id = ann_id.replace('chr', '') if ann_id.startswith('chr') else f"chr{ann_id}"
+                    if alt_id in dosage_id_to_idx:
+                        matched_variant_indices.append(dosage_id_to_idx[alt_id])
+                    else:
+                        matched_variant_indices.append(-1)  # Mark as unmatched
+                        unmatched_count += 1
+
+            if unmatched_count > 0:
+                logger.warning(f"{unmatched_count} variants in annotations not found in dosage matrix")
+
+            # Filter out unmatched variants
+            valid_indices = [i for i, idx in enumerate(matched_variant_indices) if idx >= 0]
+            valid_dosage_indices = [matched_variant_indices[i] for i in valid_indices]
+
+            if len(valid_indices) == 0:
+                logger.error("No matching variants found between annotations and dosage matrix!")
+                logger.error("Check that variant ID formats match (chr:pos:ref:alt)")
+                return
+
+            logger.info(f"Matched {len(valid_indices)} variants between annotations and dosages")
+
+            # Subset both dosages and annotations/embeddings
+            dosages = dosages[:, valid_dosage_indices]
+            annotations = annotations.iloc[valid_indices].reset_index(drop=True)
+            delta_embeddings = delta_embeddings[valid_indices]
+            positions = positions[valid_indices]
+            region_types = region_types[valid_indices]
+
+            logger.info(f"Subsetted dosages shape: {dosages.shape}")
+            logger.info(f"Subsetted embeddings shape: {delta_embeddings.shape}")
+        else:
+            # No variant IDs file - try to use original variant indices if stored
+            # Check if annotations have an 'original_idx' or similar column
+            if 'original_idx' in annotations.columns:
+                variant_indices = annotations['original_idx'].values
+                dosages = dosages[:, variant_indices]
+                logger.info(f"Subsetted dosages using original_idx: {dosages.shape}")
+            elif 'variant_idx' in annotations.columns:
+                variant_indices = annotations['variant_idx'].values
+                dosages = dosages[:, variant_indices]
+                logger.info(f"Subsetted dosages using variant_idx: {dosages.shape}")
+            else:
+                logger.error("Cannot subset dosage matrix: no variant_ids.txt found and no index column in annotations")
+                logger.error("Please provide a variant_ids.txt file in the dosages.zarr directory")
+                logger.error("Each line should be a variant ID in format: chr:pos:ref:alt")
+                logger.error(f"Expected {n_dosage_variants} lines (one per dosage column)")
+                return
+
+    # ========== END VARIANT SUBSETTING ==========
+
     # Load cohort
     logger.info(f"Loading cohort from {args.cohort}")
     cohort = pd.read_parquet(args.cohort)
