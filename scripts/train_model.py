@@ -762,23 +762,59 @@ def train_model(args):
 
     # Load dosages (supports both parquet and zarr formats)
     logger.info(f"Loading dosages from {args.dosages}")
-    dosages_path = Path(args.dosages)
+    dosages_path = Path(args.dosages).resolve()  # Get absolute path
+    logger.info(f"Resolved path: {dosages_path}")
 
-    if str(dosages_path).endswith('.zarr') or (dosages_path.is_dir() and (dosages_path / '.zarray').exists()):
+    # Check if it's a zarr store (folder with .zarray, .zgroup, or .zattrs)
+    is_zarr = (
+        str(args.dosages).endswith('.zarr') or
+        (dosages_path.is_dir() and (
+            (dosages_path / '.zarray').exists() or
+            (dosages_path / '.zgroup').exists() or
+            (dosages_path / '.zattrs').exists()
+        ))
+    )
+
+    if is_zarr:
         # Zarr format: (n_samples, n_variants) array
         try:
             import zarr
-            dosages = np.array(zarr.open(str(dosages_path), mode='r'))
+            logger.info(f"Opening zarr store at: {dosages_path}")
+            store = zarr.open(str(dosages_path), mode='r')
+
+            # Handle both array and group formats
+            if isinstance(store, zarr.Array):
+                dosages = np.array(store)
+            elif isinstance(store, zarr.Group):
+                # If it's a group, look for the dosage array inside
+                if 'dosages' in store:
+                    dosages = np.array(store['dosages'])
+                elif 'data' in store:
+                    dosages = np.array(store['data'])
+                else:
+                    # Use the first array in the group
+                    arrays = [k for k in store.keys() if isinstance(store[k], zarr.Array)]
+                    if arrays:
+                        logger.info(f"Found arrays in zarr group: {arrays}")
+                        dosages = np.array(store[arrays[0]])
+                    else:
+                        raise ValueError(f"No arrays found in zarr group. Keys: {list(store.keys())}")
+            else:
+                dosages = np.array(store)
+
             logger.info(f"Loaded zarr dosages: {dosages.shape}")
 
             # Try to load sample IDs from accompanying file
             sample_ids_path = dosages_path.parent / 'sample_ids.txt'
             if not sample_ids_path.exists():
-                sample_ids_path = dosages_path.with_suffix('.sample_ids.txt')
+                sample_ids_path = Path(str(dosages_path).replace('.zarr', '_sample_ids.txt'))
+            if not sample_ids_path.exists():
+                sample_ids_path = Path(str(dosages_path).replace('.zarr', '.sample_ids.txt'))
+
             if sample_ids_path.exists():
                 with open(sample_ids_path, 'r') as f:
                     sample_ids = [line.strip() for line in f if line.strip()]
-                logger.info(f"Loaded {len(sample_ids)} sample IDs")
+                logger.info(f"Loaded {len(sample_ids)} sample IDs from {sample_ids_path}")
             else:
                 sample_ids = [f"sample_{i}" for i in range(dosages.shape[0])]
                 logger.warning(f"No sample_ids.txt found, using generic IDs")
