@@ -311,6 +311,112 @@ def convert_bed(args):
 
     logger.info(f"Loaded dosage matrix: {n_samples} x {n_variants}")
 
+    # ========== MISSINGNESS QC FILTERING ==========
+    # Get missingness thresholds from args (with defaults)
+    max_variant_missing = getattr(args, 'max_variant_missing', 0.05)  # Default 5%
+    max_sample_missing = getattr(args, 'max_sample_missing', 0.10)    # Default 10%
+    impute_missing = getattr(args, 'impute_missing', False)
+
+    logger.info("=" * 50)
+    logger.info("MISSINGNESS QC")
+    logger.info("=" * 50)
+
+    # Calculate missingness rates
+    # For zarr arrays, we need to load into memory for this calculation
+    if zarr_path:
+        dosages_np = np.array(dosages)
+    else:
+        dosages_np = dosages
+
+    missing_mask = np.isnan(dosages_np)
+    total_missing = missing_mask.sum()
+    total_elements = dosages_np.size
+
+    if total_missing > 0:
+        missing_pct = 100 * total_missing / total_elements
+        logger.info(f"Total missing genotypes: {total_missing:,} ({missing_pct:.3f}%)")
+
+        # Per-variant missingness
+        variant_missing_rate = missing_mask.mean(axis=0)
+        logger.info(f"Variant missingness: min={variant_missing_rate.min()*100:.3f}%, "
+                   f"max={variant_missing_rate.max()*100:.3f}%, "
+                   f"mean={variant_missing_rate.mean()*100:.3f}%")
+
+        # Per-sample missingness
+        sample_missing_rate = missing_mask.mean(axis=1)
+        logger.info(f"Sample missingness: min={sample_missing_rate.min()*100:.3f}%, "
+                   f"max={sample_missing_rate.max()*100:.3f}%, "
+                   f"mean={sample_missing_rate.mean()*100:.3f}%")
+
+        # Filter samples with high missingness
+        samples_to_keep = sample_missing_rate <= max_sample_missing
+        n_samples_removed = (~samples_to_keep).sum()
+        if n_samples_removed > 0:
+            logger.warning(f"Removing {n_samples_removed:,} samples with >{max_sample_missing*100:.1f}% missing genotypes")
+            dosages_np = dosages_np[samples_to_keep, :]
+            sample_ids = [sid for sid, keep in zip(sample_ids, samples_to_keep) if keep]
+            fam_df = fam_df[samples_to_keep].reset_index(drop=True)
+            n_samples = len(sample_ids)
+            # Recalculate variant missingness after sample filtering
+            missing_mask = np.isnan(dosages_np)
+            variant_missing_rate = missing_mask.mean(axis=0)
+
+        # Filter variants with high missingness
+        variants_to_keep = variant_missing_rate <= max_variant_missing
+        n_variants_removed = (~variants_to_keep).sum()
+        if n_variants_removed > 0:
+            logger.warning(f"Removing {n_variants_removed:,} variants with >{max_variant_missing*100:.1f}% missing genotypes")
+            dosages_np = dosages_np[:, variants_to_keep]
+            bim_df = bim_df[variants_to_keep].reset_index(drop=True)
+            n_variants = len(bim_df)
+
+        # Report remaining missingness
+        missing_mask = np.isnan(dosages_np)
+        remaining_missing = missing_mask.sum()
+        if remaining_missing > 0:
+            remaining_pct = 100 * remaining_missing / dosages_np.size
+            logger.info(f"Remaining missing after filtering: {remaining_missing:,} ({remaining_pct:.3f}%)")
+
+            # Optionally impute remaining missing values using per-variant mean
+            if impute_missing:
+                logger.info("Imputing remaining missing genotypes with per-variant mean...")
+                variant_means = np.nanmean(dosages_np, axis=0)
+                # Handle variants with all missing (shouldn't happen after filtering, but safety check)
+                all_missing_variants = np.isnan(variant_means)
+                if all_missing_variants.any():
+                    variant_means[all_missing_variants] = 0.0
+
+                # Apply imputation
+                for j in range(dosages_np.shape[1]):
+                    col_missing = np.isnan(dosages_np[:, j])
+                    if col_missing.any():
+                        dosages_np[col_missing, j] = variant_means[j]
+
+                logger.info(f"Imputed {remaining_missing:,} genotypes")
+        else:
+            logger.info("No missing genotypes remaining after filtering")
+
+        # Update dosages array
+        if zarr_path:
+            # Recreate zarr array with new shape
+            dosages = zarr.open(
+                str(zarr_path),
+                mode='w',
+                shape=dosages_np.shape,
+                chunks=(min(500, n_samples), min(50000, n_variants)),
+                dtype='float32'
+            )
+            dosages[:] = dosages_np
+        else:
+            dosages = dosages_np
+
+        logger.info(f"Final matrix shape: {n_samples:,} samples x {n_variants:,} variants")
+    else:
+        logger.info("No missing genotypes found - no filtering needed")
+
+    logger.info("=" * 50)
+    # ========== END MISSINGNESS QC ==========
+
     # Save outputs
     logger.info("Saving outputs...")
 
@@ -360,12 +466,26 @@ def convert_bed(args):
 
     # QC report
     report_path = output_dir / "qc_report.txt"
+
+    # Calculate final missingness for report
+    if zarr_path:
+        final_dosages = np.array(dosages)
+    else:
+        final_dosages = dosages if isinstance(dosages, np.ndarray) else dosages_np
+    final_missing = np.isnan(final_dosages).sum()
+    final_missing_pct = 100 * final_missing / final_dosages.size if final_dosages.size > 0 else 0
+
     with open(report_path, 'w') as f:
         f.write("Variant Extraction Report (PLINK binary method)\n")
         f.write("=" * 50 + "\n\n")
-        f.write(f"Samples: {n_samples}\n")
-        f.write(f"Variants: {n_variants}\n\n")
-        f.write(f"MAF range: {np.nanmin(maf):.4f} - {np.nanmax(maf):.4f}\n")
+        f.write(f"Final Samples: {n_samples}\n")
+        f.write(f"Final Variants: {n_variants}\n\n")
+        f.write(f"MAF range: {np.nanmin(maf):.4f} - {np.nanmax(maf):.4f}\n\n")
+        f.write("Missingness QC:\n")
+        f.write(f"  Max variant missingness threshold: {max_variant_missing*100:.1f}%\n")
+        f.write(f"  Max sample missingness threshold: {max_sample_missing*100:.1f}%\n")
+        f.write(f"  Impute remaining missing: {impute_missing}\n")
+        f.write(f"  Final missing genotypes: {final_missing:,} ({final_missing_pct:.3f}%)\n")
 
     logger.info("=" * 50)
     logger.info("VARIANT EXTRACTION COMPLETE")
@@ -812,6 +932,23 @@ def main():
         dest='use_text_format',
         help='Use slow text format (.raw) instead of fast binary format (.bed)'
     )
+    run_parser.add_argument(
+        '--max-variant-missing',
+        type=float,
+        default=0.05,
+        help='Maximum variant missingness rate (default: 0.05 = 5%%)'
+    )
+    run_parser.add_argument(
+        '--max-sample-missing',
+        type=float,
+        default=0.10,
+        help='Maximum sample missingness rate (default: 0.10 = 10%%)'
+    )
+    run_parser.add_argument(
+        '--impute-missing',
+        action='store_true',
+        help='Impute remaining missing genotypes with per-variant mean after filtering'
+    )
 
     # prepare-ids subcommand (for manual workflow)
     prep_parser = subparsers.add_parser(
@@ -870,6 +1007,23 @@ def main():
         '--output-dir',
         default='data/variants',
         help='Output directory'
+    )
+    bed_parser.add_argument(
+        '--max-variant-missing',
+        type=float,
+        default=0.05,
+        help='Maximum variant missingness rate (default: 0.05 = 5%%)'
+    )
+    bed_parser.add_argument(
+        '--max-sample-missing',
+        type=float,
+        default=0.10,
+        help='Maximum sample missingness rate (default: 0.10 = 10%%)'
+    )
+    bed_parser.add_argument(
+        '--impute-missing',
+        action='store_true',
+        help='Impute remaining missing genotypes with per-variant mean after filtering'
     )
 
     # Also allow running without subcommand (same as 'run')

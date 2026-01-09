@@ -688,6 +688,30 @@ def train_model_cv(
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
+    # Check for missing genotypes in dosages and report statistics
+    missing_mask = np.isnan(dosages)
+    n_missing = missing_mask.sum()
+    if n_missing > 0:
+        total_elements = dosages.size
+        missing_pct = 100 * n_missing / total_elements
+
+        # Per-variant missingness
+        variant_missing_rate = missing_mask.mean(axis=0)
+        max_variant_missing = variant_missing_rate.max() * 100
+        variants_with_missing = (variant_missing_rate > 0).sum()
+
+        # Per-sample missingness
+        sample_missing_rate = missing_mask.mean(axis=1)
+        max_sample_missing = sample_missing_rate.max() * 100
+        samples_with_missing = (sample_missing_rate > 0).sum()
+
+        logger.warning(f"Found {n_missing:,} missing genotypes ({missing_pct:.2f}% of matrix)")
+        logger.warning(f"  Variants with missing data: {variants_with_missing:,}/{dosages.shape[1]:,}")
+        logger.warning(f"  Max variant missingness: {max_variant_missing:.2f}%")
+        logger.warning(f"  Samples with missing data: {samples_with_missing:,}/{dosages.shape[0]:,}")
+        logger.warning(f"  Max sample missingness: {max_sample_missing:.2f}%")
+        logger.info("Will use per-variant mean imputation (computed from training set each fold)")
+
     fold_metrics = []
     best_model_state = None
     best_auroc = 0
@@ -703,11 +727,43 @@ def train_model_cv(
         val_dosages = torch.FloatTensor(dosages[val_idx])
         val_labels = torch.FloatTensor(labels[val_idx])
 
-        # Check dosages for NaN/Inf
+        # Per-variant mean imputation for missing genotypes
+        # Use training set means to avoid data leakage
         if torch.isnan(train_dosages).any() or torch.isnan(val_dosages).any():
-            logger.warning("Found NaN in dosages, replacing with 0")
-            train_dosages = torch.nan_to_num(train_dosages, nan=0.0)
-            val_dosages = torch.nan_to_num(val_dosages, nan=0.0)
+            # Compute per-variant mean from training data only
+            # nanmean computes mean ignoring NaN values
+            variant_means = torch.nanmean(train_dosages, dim=0)
+
+            # Handle variants where ALL training samples are missing (rare edge case)
+            # Use 0 (assumes rare variant with no observed alt alleles)
+            all_missing_mask = torch.isnan(variant_means)
+            if all_missing_mask.any():
+                n_all_missing = all_missing_mask.sum().item()
+                logger.warning(f"  {n_all_missing} variants have no observed genotypes in training, using 0")
+                variant_means[all_missing_mask] = 0.0
+
+            # Count imputed values
+            train_nan_count = torch.isnan(train_dosages).sum().item()
+            val_nan_count = torch.isnan(val_dosages).sum().item()
+
+            # Impute training set: replace NaN with per-variant mean
+            train_nan_mask = torch.isnan(train_dosages)
+            train_dosages = torch.where(
+                train_nan_mask,
+                variant_means.unsqueeze(0).expand_as(train_dosages),
+                train_dosages
+            )
+
+            # Impute validation set: use TRAINING means (no data leakage)
+            val_nan_mask = torch.isnan(val_dosages)
+            val_dosages = torch.where(
+                val_nan_mask,
+                variant_means.unsqueeze(0).expand_as(val_dosages),
+                val_dosages
+            )
+
+            logger.info(f"  Imputed {train_nan_count:,} training + {val_nan_count:,} validation genotypes "
+                       f"using per-variant mean from training set")
 
         # Create data loaders
         train_dataset = TensorDataset(train_dosages, train_labels)
