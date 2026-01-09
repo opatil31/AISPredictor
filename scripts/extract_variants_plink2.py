@@ -411,6 +411,25 @@ def convert_bed(args):
             dosages = dosages_np
 
         logger.info(f"Final matrix shape: {n_samples:,} samples x {n_variants:,} variants")
+
+        # Check if all data was filtered out
+        if n_samples == 0 or n_variants == 0:
+            logger.error("=" * 50)
+            logger.error("CRITICAL: All data was filtered out!")
+            logger.error("=" * 50)
+            logger.error("This indicates a data quality issue. Possible causes:")
+            logger.error("  1. Source PLINK files may not be imputed (raw genotypes have higher missingness)")
+            logger.error("  2. QC thresholds may be too strict for this dataset")
+            logger.error("  3. There may be an issue with the genotype encoding")
+            logger.error("")
+            logger.error("Recommendations:")
+            logger.error("  1. Check your source PLINK files with: plink2 --bfile <prefix> --missing")
+            logger.error("  2. Try more lenient thresholds: --max-sample-missing 0.25 --max-variant-missing 0.10")
+            logger.error("  3. If data is not imputed, consider imputation with a reference panel")
+            logger.error("")
+            logger.error("No output files will be saved.")
+            return
+
     else:
         logger.info("No missing genotypes found - no filtering needed")
 
