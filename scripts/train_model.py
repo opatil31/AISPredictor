@@ -800,7 +800,7 @@ def train_model_cv(
                         logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
                     probs = torch.softmax(logits, dim=-1)[:, 1]
 
-                    val_probs.extend(probs.cpu().numpy())
+                    val_probs.extend(probs.float().cpu().numpy())
                     val_true.extend(batch_labels.numpy())
 
             val_auroc = roc_auc_score(val_true, val_probs)
@@ -839,7 +839,7 @@ def train_model_cv(
                 logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
                 probs = torch.softmax(logits, dim=-1)[:, 1]
 
-                val_probs.extend(probs.cpu().numpy())
+                val_probs.extend(probs.float().cpu().numpy())
                 val_true.extend(batch_labels.numpy())
 
         val_probs = np.array(val_probs)
