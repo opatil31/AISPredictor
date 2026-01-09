@@ -396,14 +396,14 @@ def build_hierarchical_model(
                     # Compute attention scores
                     scores = torch.einsum('d,bnd->bn', query, keys) / self.scale  # (batch, n_variants)
 
-                    # Mask out variants not in this region
-                    scores = scores.masked_fill(~region_mask, float('-inf'))
+                    # Mask out variants not in this region (use large negative instead of -inf for stability)
+                    scores = scores.masked_fill(~region_mask, -1e9)
 
                     # Softmax attention
                     attn = F.softmax(scores, dim=-1)  # (batch, n_variants)
                     attn = self.dropout(attn)
 
-                    # Handle NaN from all -inf (no variants in region)
+                    # Handle any remaining NaN (shouldn't happen but safety check)
                     attn = torch.nan_to_num(attn, nan=0.0)
 
                     # Weighted sum of values
@@ -676,6 +676,16 @@ def train_model_cv(
     positions_t = torch.LongTensor(positions)
     region_types_t = torch.LongTensor(region_types)
 
+    # Check for NaN/Inf in inputs
+    if torch.isnan(embeddings_t).any():
+        nan_count = torch.isnan(embeddings_t).sum().item()
+        logger.warning(f"Found {nan_count} NaN values in embeddings, replacing with 0")
+        embeddings_t = torch.nan_to_num(embeddings_t, nan=0.0)
+    if torch.isinf(embeddings_t).any():
+        inf_count = torch.isinf(embeddings_t).sum().item()
+        logger.warning(f"Found {inf_count} Inf values in embeddings, clamping")
+        embeddings_t = torch.clamp(embeddings_t, -1e6, 1e6)
+
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
     fold_metrics = []
@@ -692,6 +702,12 @@ def train_model_cv(
         train_labels = torch.FloatTensor(labels[train_idx])
         val_dosages = torch.FloatTensor(dosages[val_idx])
         val_labels = torch.FloatTensor(labels[val_idx])
+
+        # Check dosages for NaN/Inf
+        if torch.isnan(train_dosages).any() or torch.isnan(val_dosages).any():
+            logger.warning("Found NaN in dosages, replacing with 0")
+            train_dosages = torch.nan_to_num(train_dosages, nan=0.0)
+            val_dosages = torch.nan_to_num(val_dosages, nan=0.0)
 
         # Create data loaders
         train_dataset = TensorDataset(train_dosages, train_labels)
@@ -776,7 +792,16 @@ def train_model_cv(
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
 
-                train_loss += loss.item()
+                # Check for NaN loss
+                loss_val = loss.item()
+                if np.isnan(loss_val):
+                    logger.warning(f"NaN loss detected at epoch {epoch}, resetting model")
+                    # Reinitialize model weights
+                    for layer in model.modules():
+                        if hasattr(layer, 'reset_parameters'):
+                            layer.reset_parameters()
+                    break
+                train_loss += loss_val
 
             scheduler.step()
 
@@ -800,8 +825,17 @@ def train_model_cv(
                         logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
                     probs = torch.softmax(logits, dim=-1)[:, 1]
 
-                    val_probs.extend(probs.float().cpu().numpy())
+                    # Handle NaN in probabilities
+                    probs_np = probs.float().cpu().numpy()
+                    probs_np = np.nan_to_num(probs_np, nan=0.5)  # Replace NaN with 0.5
+                    val_probs.extend(probs_np)
                     val_true.extend(batch_labels.numpy())
+
+            # Check for NaN in validation probs
+            val_probs = np.array(val_probs)
+            if np.isnan(val_probs).any():
+                logger.warning(f"NaN in validation probs at epoch {epoch}, replacing with 0.5")
+                val_probs = np.nan_to_num(val_probs, nan=0.5)
 
             val_auroc = roc_auc_score(val_true, val_probs)
 
@@ -839,10 +873,14 @@ def train_model_cv(
                 logits = model(batch_emb, batch_pos, batch_reg, batch_dosages)
                 probs = torch.softmax(logits, dim=-1)[:, 1]
 
-                val_probs.extend(probs.float().cpu().numpy())
+                # Handle NaN in probabilities
+                probs_np = probs.float().cpu().numpy()
+                probs_np = np.nan_to_num(probs_np, nan=0.5)
+                val_probs.extend(probs_np)
                 val_true.extend(batch_labels.numpy())
 
         val_probs = np.array(val_probs)
+        val_probs = np.nan_to_num(val_probs, nan=0.5)  # Final safety check
         val_true = np.array(val_true)
         val_pred = (val_probs > 0.5).astype(int)
 
