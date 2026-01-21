@@ -68,6 +68,7 @@ def run_plink2_ld_prune(
     step: int = DEFAULT_STEP,
     r2_threshold: float = DEFAULT_R2_THRESHOLD,
     maf_min: float = 0.01,
+    maf_max: float = None,
     hwe_p_min: float = 1e-6,
 ) -> Optional[List[str]]:
     """
@@ -81,6 +82,8 @@ def run_plink2_ld_prune(
         window_kb: LD window size in kb
         step: Step size in variants
         r2_threshold: r² threshold for pruning
+        maf_min: Minimum MAF (set to 0 for rare variant analysis)
+        maf_max: Maximum MAF (for rare variant analysis, e.g., 0.01)
 
     Returns:
         List of variant IDs that passed pruning, or None if failed
@@ -98,6 +101,10 @@ def run_plink2_ld_prune(
         '--indep-pairwise', str(window_kb), 'kb', str(step), str(r2_threshold),
         '--out', output_prefix
     ]
+
+    # Add max-maf filter for rare variant analysis
+    if maf_max is not None:
+        prune_cmd.extend(['--max-maf', str(maf_max)])
 
     logger.info(f"Command: {' '.join(prune_cmd)}")
 
@@ -385,6 +392,7 @@ def prune_with_plink2(args):
         step=args.step,
         r2_threshold=args.r2_threshold,
         maf_min=args.maf_min,
+        maf_max=getattr(args, 'maf_max', None),
         hwe_p_min=args.hwe_p_min,
     )
 
@@ -623,7 +631,12 @@ def main():
     )
     plink2_parser.add_argument(
         '--maf-min', type=float, default=0.01,
-        help='Minimum MAF (default: 0.01)'
+        help='Minimum MAF (default: 0.01). Set to 0 for rare variant analysis.'
+    )
+    plink2_parser.add_argument(
+        '--maf-max', type=float, default=None,
+        help='Maximum MAF for rare variant analysis (e.g., 0.01 for <1%%). '
+             'When set, filters OUT common variants and keeps only rare variants.'
     )
     plink2_parser.add_argument(
         '--hwe-p-min', type=float, default=1e-6,
