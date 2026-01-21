@@ -845,7 +845,7 @@ def run_full_pipeline(args):
     logger.info(f"STEP 3: Running PLINK2 QC and export (format: {export_format})")
     logger.info("=" * 50)
 
-    output_prefix = str(output_dir / "chr6_filtered")
+    output_prefix = str(output_dir / args.output_prefix)
 
     success = run_plink2(
         plink2_path=plink2_path,
@@ -985,6 +985,11 @@ def main():
         '--impute-missing',
         action='store_true',
         help='Impute remaining missing genotypes with per-variant mean after filtering'
+    )
+    run_parser.add_argument(
+        '--output-prefix',
+        default='filtered',
+        help='Prefix for output files (default: "filtered"). Files will be named <prefix>.bed/.bim/.fam'
     )
 
     # prepare-ids subcommand (for manual workflow)

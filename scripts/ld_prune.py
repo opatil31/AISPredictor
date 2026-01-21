@@ -381,7 +381,7 @@ def prune_with_plink2(args):
     logger.info(f"Wrote {len(cohort)} sample IDs")
 
     # Run PLINK2 LD pruning
-    output_prefix = str(output_dir / "chr6")
+    output_prefix = str(output_dir / args.output_prefix)
 
     pruned_variants = run_plink2_ld_prune(
         plink2_path=plink2_path,
@@ -484,7 +484,7 @@ def prune_from_bed(args):
 
     # Step 1: Run LD pruning
     logger.info("Step 1: Running PLINK2 LD pruning...")
-    output_prefix = str(output_dir / "chr6")
+    output_prefix = str(output_dir / args.output_prefix)
 
     prune_cmd = [
         plink2_path,
@@ -642,6 +642,10 @@ def main():
         '--hwe-p-min', type=float, default=1e-6,
         help='Minimum HWE p-value (default: 1e-6)'
     )
+    plink2_parser.add_argument(
+        '--output-prefix', default='pruned',
+        help='Prefix for output files (default: "pruned"). Files will be named <prefix>.bed/.bim/.fam'
+    )
 
     # From existing .bed files (RECOMMENDED for already-extracted data)
     bed_parser = subparsers.add_parser(
@@ -671,6 +675,10 @@ def main():
     bed_parser.add_argument(
         '--r2-threshold', type=float, default=DEFAULT_R2_THRESHOLD,
         help=f'r² threshold (default: {DEFAULT_R2_THRESHOLD})'
+    )
+    bed_parser.add_argument(
+        '--output-prefix', default='pruned',
+        help='Prefix for output files (default: "pruned"). Files will be named <prefix>.bed/.bim/.fam'
     )
 
     # Python method (prune existing data)
