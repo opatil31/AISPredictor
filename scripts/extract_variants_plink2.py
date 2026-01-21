@@ -128,7 +128,8 @@ def find_plink2() -> str:
 
 
 def run_plink2(plink2_path: str, pfile: str, keep_file: str, output_prefix: str,
-               maf: float = 0.01, hwe_p: float = 1e-6, export_format: str = 'bed') -> bool:
+               maf: float = 0.01, max_maf: float = None, mac: int = None,
+               hwe_p: float = 1e-6, export_format: str = 'bed') -> bool:
     """
     Run PLINK2 to filter variants and export.
 
@@ -137,7 +138,9 @@ def run_plink2(plink2_path: str, pfile: str, keep_file: str, output_prefix: str,
         pfile: Path prefix to .pgen/.pvar/.psam files
         keep_file: Path to file with sample IDs to keep
         output_prefix: Output file prefix
-        maf: Minimum minor allele frequency
+        maf: Minimum minor allele frequency (use 0 or very small for rare variants)
+        max_maf: Maximum minor allele frequency (for rare variant analysis)
+        mac: Minimum minor allele count (alternative to maf for rare variants)
         hwe_p: Minimum HWE p-value
         export_format: 'bed' for binary (fast) or 'raw' for text (slow)
 
@@ -168,6 +171,14 @@ def run_plink2(plink2_path: str, pfile: str, keep_file: str, output_prefix: str,
             '--export', 'A',
             '--out', output_prefix
         ]
+
+    # Add max-maf filter for rare variant analysis
+    if max_maf is not None:
+        cmd.extend(['--max-maf', str(max_maf)])
+
+    # Add MAC filter (minimum allele count) for rare variant quality control
+    if mac is not None:
+        cmd.extend(['--mac', str(mac)])
 
     logger.info(f"Running PLINK2 command:")
     logger.info(f"  {' '.join(cmd)}")
@@ -839,7 +850,7 @@ def run_full_pipeline(args):
     logger.info(f"STEP 3: Running PLINK2 QC and export (format: {export_format})")
     logger.info("=" * 50)
 
-    output_prefix = str(output_dir / "chr6_filtered")
+    output_prefix = str(output_dir / args.output_prefix)
 
     success = run_plink2(
         plink2_path=plink2_path,
@@ -847,6 +858,8 @@ def run_full_pipeline(args):
         keep_file=str(ids_path),
         output_prefix=output_prefix,
         maf=args.maf_min,
+        max_maf=getattr(args, 'maf_max', None),
+        mac=getattr(args, 'mac', None),
         hwe_p=args.hwe_p_min,
         export_format=export_format
     )
@@ -930,7 +943,21 @@ def main():
         '--maf-min',
         type=float,
         default=0.01,
-        help='Minimum MAF (default: 0.01)'
+        help='Minimum MAF (default: 0.01). Set to 0 or very small for rare variant analysis.'
+    )
+    run_parser.add_argument(
+        '--maf-max',
+        type=float,
+        default=None,
+        help='Maximum MAF for rare variant analysis (e.g., 0.01 for <1%%, 0.05 for <5%%). '
+             'When set, filters OUT common variants and keeps only rare variants.'
+    )
+    run_parser.add_argument(
+        '--mac',
+        type=int,
+        default=None,
+        help='Minimum minor allele count. More meaningful than MAF for rare variants. '
+             'E.g., --mac 10 keeps variants present in at least 10 alleles (5 hets or fewer homs).'
     )
     run_parser.add_argument(
         '--hwe-p-min',
@@ -971,6 +998,11 @@ def main():
         '--impute-missing',
         action='store_true',
         help='Impute remaining missing genotypes with per-variant mean after filtering'
+    )
+    run_parser.add_argument(
+        '--output-prefix',
+        default='filtered',
+        help='Prefix for output files (default: "filtered"). Files will be named <prefix>.bed/.bim/.fam'
     )
 
     # prepare-ids subcommand (for manual workflow)
