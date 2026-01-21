@@ -703,8 +703,16 @@ def main():
                        help='Which test(s) to run (default: all)')
     parser.add_argument('--min-variants', type=int, default=2,
                        help='Minimum variants per gene (default: 2)')
+    parser.add_argument('--functional-only', action='store_true',
+                       help='Only test genes with functional variants (missense, splice, stop, frameshift)')
+    parser.add_argument('--burden-only', action='store_true',
+                       help='Run only burden test (fastest, skip SKAT)')
 
     args = parser.parse_args()
+
+    # Override method if burden-only specified
+    if args.burden_only:
+        args.method = 'burden'
 
     logger.info("=" * 50)
     logger.info("Burden Test / SKAT Analysis")
@@ -736,6 +744,36 @@ def main():
         variant_consequences = annotations['Consequence'].fillna('').tolist()
     else:
         variant_consequences = [''] * len(annotations)
+
+    # Filter to functional variants if requested
+    if args.functional_only:
+        functional_consequences = {
+            'missense_variant', 'stop_gained', 'stop_lost', 'start_lost',
+            'frameshift_variant', 'inframe_insertion', 'inframe_deletion',
+            'splice_acceptor_variant', 'splice_donor_variant', 'splice_region_variant',
+            'protein_altering_variant', 'coding_sequence_variant'
+        }
+
+        functional_mask = []
+        for cons in variant_consequences:
+            is_functional = False
+            if cons:
+                for c in cons.split(','):
+                    if c.strip() in functional_consequences:
+                        is_functional = True
+                        break
+            functional_mask.append(is_functional)
+
+        functional_mask = np.array(functional_mask)
+        n_functional = functional_mask.sum()
+
+        if n_functional == 0:
+            logger.warning("No functional variants found! Running on all variants instead.")
+        else:
+            logger.info(f"Filtering to {n_functional} functional variants (from {len(functional_mask)})")
+            dosages = dosages[:, functional_mask]
+            variant_genes = [g for g, m in zip(variant_genes, functional_mask) if m]
+            variant_consequences = [c for c, m in zip(variant_consequences, functional_mask) if m]
 
     # Load cohort
     logger.info(f"\nLoading cohort from {args.cohort}")
