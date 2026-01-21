@@ -740,12 +740,30 @@ def interpret_model(args):
     else:
         variant_genes = [''] * len(annotations)
 
-    # Load dosages
-    dosages_df = pd.read_parquet(args.dosages)
-    variant_cols = ['SNP', 'CHR', 'POS', 'A1', 'A2', 'REF', 'ALT', 'variant_id']
-    sample_cols = [c for c in dosages_df.columns if c not in variant_cols]
-    dosages = dosages_df[sample_cols].values.T
-    sample_ids = sample_cols
+    # Load dosages (support both parquet and zarr formats)
+    dosages_path = Path(args.dosages)
+    if dosages_path.suffix == '.zarr' or (dosages_path.is_dir() and (dosages_path / '.zarray').exists()):
+        # Zarr format
+        try:
+            import zarr
+            dosages = np.array(zarr.open(str(dosages_path), mode='r'))
+            logger.info(f"Loaded dosages from zarr: {dosages.shape}")
+            # For zarr, we need sample IDs from a separate file
+            sample_ids_path = dosages_path.parent / 'sample_ids.txt'
+            if sample_ids_path.exists():
+                with open(sample_ids_path, 'r') as f:
+                    sample_ids = [line.strip() for line in f if line.strip()]
+            else:
+                sample_ids = [str(i) for i in range(dosages.shape[0])]
+        except ImportError:
+            raise ImportError("zarr required for .zarr files. Install with: pip install zarr")
+    else:
+        # Parquet format
+        dosages_df = pd.read_parquet(args.dosages)
+        variant_cols = ['SNP', 'CHR', 'POS', 'A1', 'A2', 'REF', 'ALT', 'variant_id']
+        sample_cols = [c for c in dosages_df.columns if c not in variant_cols]
+        dosages = dosages_df[sample_cols].values.T
+        sample_ids = sample_cols
 
     logger.info(f"Loaded dosages: {dosages.shape}")
 
