@@ -1113,6 +1113,60 @@ def train_model(args):
     annotations = pd.read_parquet(args.annotations)
     logger.info(f"Loaded {len(annotations)} variants")
 
+    # ========== VARIANT FILTERING ==========
+    original_count = len(annotations)
+    filter_mask = np.ones(len(annotations), dtype=bool)
+
+    # MAF filtering for rare variants
+    if args.max_maf is not None:
+        if 'MAF' in annotations.columns:
+            maf_mask = annotations['MAF'] <= args.max_maf
+            filter_mask &= maf_mask.values
+            logger.info(f"MAF filter (≤{args.max_maf}): {maf_mask.sum():,} variants pass")
+        elif 'AF' in annotations.columns:
+            # Convert AF to MAF
+            af = annotations['AF'].values
+            maf = np.minimum(af, 1 - af)
+            maf_mask = maf <= args.max_maf
+            filter_mask &= maf_mask
+            logger.info(f"MAF filter (≤{args.max_maf}): {maf_mask.sum():,} variants pass")
+        else:
+            logger.warning("No MAF/AF column found - skipping MAF filter")
+
+    # Functional variant filtering
+    if args.functional_only:
+        functional_consequences = {
+            'missense_variant', 'stop_gained', 'stop_lost', 'start_lost',
+            'frameshift_variant', 'inframe_insertion', 'inframe_deletion',
+            'splice_acceptor_variant', 'splice_donor_variant', 'splice_region_variant',
+            'protein_altering_variant', 'coding_sequence_variant'
+        }
+
+        if 'most_severe_consequence' in annotations.columns:
+            func_mask = annotations['most_severe_consequence'].isin(functional_consequences)
+            filter_mask &= func_mask.values
+            logger.info(f"Functional filter: {func_mask.sum():,} coding/splice variants")
+        elif 'Consequence' in annotations.columns:
+            func_mask = annotations['Consequence'].apply(
+                lambda x: any(c in functional_consequences for c in str(x).split(','))
+            )
+            filter_mask &= func_mask.values
+            logger.info(f"Functional filter: {func_mask.sum():,} coding/splice variants")
+        else:
+            logger.warning("No consequence column found - skipping functional filter")
+
+    # Apply filters
+    if filter_mask.sum() < original_count:
+        annotations = annotations[filter_mask].reset_index(drop=True)
+        delta_embeddings = delta_embeddings[filter_mask]
+        logger.info(f"After filtering: {len(annotations):,} variants (from {original_count:,})")
+
+        if len(annotations) == 0:
+            logger.error("No variants remaining after filtering!")
+            return
+
+    # ========== END VARIANT FILTERING ==========
+
     # Get positions and region types
     positions = annotations['POS'].values if 'POS' in annotations.columns else np.arange(len(annotations))
 
@@ -1567,6 +1621,12 @@ def main():
     parser.add_argument('--model-type', default='hierarchical',
                        choices=['hierarchical', 'baseline', 'prs'],
                        help='Model type: hierarchical (uses embeddings), baseline (mean pooling), prs (dosages only, no embeddings)')
+
+    # Variant filtering (for rare variant analysis)
+    parser.add_argument('--max-maf', type=float, default=None,
+                       help='Maximum MAF for rare variant analysis (e.g., 0.01 for <1%%, 0.05 for <5%%)')
+    parser.add_argument('--functional-only', action='store_true',
+                       help='Only use functional variants (missense, splice, frameshift, stop gained/lost)')
 
     # Training parameters
     parser.add_argument('--n-folds', type=int, default=5,
