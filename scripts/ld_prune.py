@@ -69,6 +69,7 @@ def run_plink2_ld_prune(
     r2_threshold: float = DEFAULT_R2_THRESHOLD,
     maf_min: float = 0.01,
     maf_max: float = None,
+    mac: int = None,
     hwe_p_min: float = 1e-6,
 ) -> Optional[List[str]]:
     """
@@ -84,6 +85,7 @@ def run_plink2_ld_prune(
         r2_threshold: r² threshold for pruning
         maf_min: Minimum MAF (set to 0 for rare variant analysis)
         maf_max: Maximum MAF (for rare variant analysis, e.g., 0.01)
+        mac: Minimum minor allele count (alternative to maf_min for rare variants)
 
     Returns:
         List of variant IDs that passed pruning, or None if failed
@@ -105,6 +107,10 @@ def run_plink2_ld_prune(
     # Add max-maf filter for rare variant analysis
     if maf_max is not None:
         prune_cmd.extend(['--max-maf', str(maf_max)])
+
+    # Add MAC filter (minimum allele count) for rare variant quality control
+    if mac is not None:
+        prune_cmd.extend(['--mac', str(mac)])
 
     logger.info(f"Command: {' '.join(prune_cmd)}")
 
@@ -393,6 +399,7 @@ def prune_with_plink2(args):
         r2_threshold=args.r2_threshold,
         maf_min=args.maf_min,
         maf_max=getattr(args, 'maf_max', None),
+        mac=getattr(args, 'mac', None),
         hwe_p_min=args.hwe_p_min,
     )
 
@@ -637,6 +644,11 @@ def main():
         '--maf-max', type=float, default=None,
         help='Maximum MAF for rare variant analysis (e.g., 0.01 for <1%%). '
              'When set, filters OUT common variants and keeps only rare variants.'
+    )
+    plink2_parser.add_argument(
+        '--mac', type=int, default=None,
+        help='Minimum minor allele count. More meaningful than MAF for rare variants. '
+             'E.g., --mac 10 keeps variants present in at least 10 alleles.'
     )
     plink2_parser.add_argument(
         '--hwe-p-min', type=float, default=1e-6,

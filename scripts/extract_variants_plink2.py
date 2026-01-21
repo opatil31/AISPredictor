@@ -128,8 +128,8 @@ def find_plink2() -> str:
 
 
 def run_plink2(plink2_path: str, pfile: str, keep_file: str, output_prefix: str,
-               maf: float = 0.01, max_maf: float = None, hwe_p: float = 1e-6,
-               export_format: str = 'bed') -> bool:
+               maf: float = 0.01, max_maf: float = None, mac: int = None,
+               hwe_p: float = 1e-6, export_format: str = 'bed') -> bool:
     """
     Run PLINK2 to filter variants and export.
 
@@ -140,6 +140,7 @@ def run_plink2(plink2_path: str, pfile: str, keep_file: str, output_prefix: str,
         output_prefix: Output file prefix
         maf: Minimum minor allele frequency (use 0 or very small for rare variants)
         max_maf: Maximum minor allele frequency (for rare variant analysis)
+        mac: Minimum minor allele count (alternative to maf for rare variants)
         hwe_p: Minimum HWE p-value
         export_format: 'bed' for binary (fast) or 'raw' for text (slow)
 
@@ -174,6 +175,10 @@ def run_plink2(plink2_path: str, pfile: str, keep_file: str, output_prefix: str,
     # Add max-maf filter for rare variant analysis
     if max_maf is not None:
         cmd.extend(['--max-maf', str(max_maf)])
+
+    # Add MAC filter (minimum allele count) for rare variant quality control
+    if mac is not None:
+        cmd.extend(['--mac', str(mac)])
 
     logger.info(f"Running PLINK2 command:")
     logger.info(f"  {' '.join(cmd)}")
@@ -854,6 +859,7 @@ def run_full_pipeline(args):
         output_prefix=output_prefix,
         maf=args.maf_min,
         max_maf=getattr(args, 'maf_max', None),
+        mac=getattr(args, 'mac', None),
         hwe_p=args.hwe_p_min,
         export_format=export_format
     )
@@ -945,6 +951,13 @@ def main():
         default=None,
         help='Maximum MAF for rare variant analysis (e.g., 0.01 for <1%%, 0.05 for <5%%). '
              'When set, filters OUT common variants and keeps only rare variants.'
+    )
+    run_parser.add_argument(
+        '--mac',
+        type=int,
+        default=None,
+        help='Minimum minor allele count. More meaningful than MAF for rare variants. '
+             'E.g., --mac 10 keeps variants present in at least 10 alleles (5 hets or fewer homs).'
     )
     run_parser.add_argument(
         '--hwe-p-min',
