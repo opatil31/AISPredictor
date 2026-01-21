@@ -597,6 +597,85 @@ def build_baseline_model(embedding_dim: int = 256, hidden_dim: int = 128, dropou
     return MeanPoolingBaseline(embedding_dim, hidden_dim, dropout)
 
 
+def build_prs_model(n_variants: int, hidden_dim: int = 64, dropout: float = 0.3):
+    """
+    Build a simple PRS (Polygenic Risk Score) model using ONLY dosages.
+
+    This is a diagnostic baseline to test if genetic signal exists at all,
+    independent of the embeddings. If this model also shows AUROC ~0.5,
+    then either:
+    1. No genetic signal in these variants for AIS
+    2. Sample size too small
+    3. Need different variants
+
+    If this model shows AUROC > 0.5, then the embeddings are the problem.
+    """
+    import torch
+    import torch.nn as nn
+
+    class PRSModel(nn.Module):
+        """
+        Simple PRS-style model: linear combination of dosages.
+
+        PRS = sum(beta_i * dosage_i)
+
+        With optional hidden layer for non-linear interactions.
+        """
+
+        def __init__(self, n_variants, hidden_dim, dropout):
+            super().__init__()
+            self.n_variants = n_variants
+
+            # Linear PRS layer - learns effect size for each variant
+            self.prs_weights = nn.Linear(n_variants, 1, bias=False)
+
+            # Optional: small MLP for non-linear combination
+            # This allows epistatic interactions
+            self.classifier = nn.Sequential(
+                nn.Linear(n_variants, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(32, 2)
+            )
+
+            # Initialize with small weights (typical GWAS effect sizes are small)
+            nn.init.normal_(self.prs_weights.weight, mean=0, std=0.01)
+
+        def forward(self, embeddings, positions, region_types, dosages, mask=None):
+            """
+            Forward pass - ignores embeddings, uses only dosages.
+
+            Args:
+                embeddings: ignored
+                positions: ignored
+                region_types: ignored
+                dosages: (batch, n_variants) genotype dosages
+                mask: ignored
+
+            Returns:
+                (batch, 2) logits
+            """
+            # Use MLP classifier on raw dosages
+            return self.classifier(dosages)
+
+        def get_prs_score(self, dosages):
+            """Get linear PRS score (for interpretability)."""
+            return self.prs_weights(dosages).squeeze(-1)
+
+        def get_top_variants(self, k=50):
+            """Get indices of top k variants by absolute weight."""
+            import torch
+            weights = self.prs_weights.weight.squeeze().abs()
+            _, top_idx = torch.topk(weights, min(k, len(weights)))
+            return top_idx.cpu().numpy()
+
+    return PRSModel(n_variants, hidden_dim, dropout)
+
+
 class AISDataset:
     """Dataset for AIS prediction with hierarchical model."""
 
@@ -774,8 +853,11 @@ def train_model_cv(
 
         # Build model
         embedding_dim = embeddings.shape[1]
+        n_variants = embeddings.shape[0]
         if model_type == 'hierarchical':
             model = build_hierarchical_model(embedding_dim=embedding_dim)
+        elif model_type == 'prs':
+            model = build_prs_model(n_variants=n_variants)
         else:
             model = build_baseline_model(embedding_dim=embedding_dim)
         model = model.to(device)
@@ -975,6 +1057,8 @@ def train_model_cv(
     # Build final model with best weights
     if model_type == 'hierarchical':
         final_model = build_hierarchical_model(embedding_dim=embeddings.shape[1])
+    elif model_type == 'prs':
+        final_model = build_prs_model(n_variants=embeddings.shape[0])
     else:
         final_model = build_baseline_model(embedding_dim=embeddings.shape[1])
     final_model.load_state_dict(best_model_state)
@@ -1001,10 +1085,87 @@ def train_model(args):
 
     logger.info(f"Delta embeddings shape: {delta_embeddings.shape}")
 
+    # Check embedding statistics and normalize if needed
+    emb_mean = delta_embeddings.mean()
+    emb_std = delta_embeddings.std()
+    logger.info(f"Delta embeddings stats: mean={emb_mean:.6f}, std={emb_std:.6f}")
+
+    if emb_std < 0.01:
+        logger.warning(f"Delta embeddings have very small std ({emb_std:.6f}), normalizing...")
+        # Z-score normalization: (x - mean) / std
+        # This scales embeddings to have mean=0, std=1
+        delta_embeddings = (delta_embeddings - emb_mean) / (emb_std + 1e-8)
+        logger.info(f"After normalization: mean={delta_embeddings.mean():.6f}, std={delta_embeddings.std():.6f}")
+
+    # Log model type and implications
+    if args.model_type == 'prs':
+        logger.info("")
+        logger.info("=" * 50)
+        logger.info("USING PRS MODEL (dosages only, embeddings ignored)")
+        logger.info("=" * 50)
+        logger.info("This baseline tests if genetic signal exists independent of embeddings.")
+        logger.info("If AUROC ~0.5: No genetic signal in variants or insufficient sample size.")
+        logger.info("If AUROC >0.55: Signal exists; embedding approach needs revision.")
+        logger.info("")
+
     # Load annotations
     logger.info(f"Loading annotations from {args.annotations}")
     annotations = pd.read_parquet(args.annotations)
     logger.info(f"Loaded {len(annotations)} variants")
+
+    # ========== VARIANT FILTERING ==========
+    original_count = len(annotations)
+    filter_mask = np.ones(len(annotations), dtype=bool)
+
+    # MAF filtering for rare variants
+    if args.max_maf is not None:
+        if 'MAF' in annotations.columns:
+            maf_mask = annotations['MAF'] <= args.max_maf
+            filter_mask &= maf_mask.values
+            logger.info(f"MAF filter (≤{args.max_maf}): {maf_mask.sum():,} variants pass")
+        elif 'AF' in annotations.columns:
+            # Convert AF to MAF
+            af = annotations['AF'].values
+            maf = np.minimum(af, 1 - af)
+            maf_mask = maf <= args.max_maf
+            filter_mask &= maf_mask
+            logger.info(f"MAF filter (≤{args.max_maf}): {maf_mask.sum():,} variants pass")
+        else:
+            logger.warning("No MAF/AF column found - skipping MAF filter")
+
+    # Functional variant filtering
+    if args.functional_only:
+        functional_consequences = {
+            'missense_variant', 'stop_gained', 'stop_lost', 'start_lost',
+            'frameshift_variant', 'inframe_insertion', 'inframe_deletion',
+            'splice_acceptor_variant', 'splice_donor_variant', 'splice_region_variant',
+            'protein_altering_variant', 'coding_sequence_variant'
+        }
+
+        if 'most_severe_consequence' in annotations.columns:
+            func_mask = annotations['most_severe_consequence'].isin(functional_consequences)
+            filter_mask &= func_mask.values
+            logger.info(f"Functional filter: {func_mask.sum():,} coding/splice variants")
+        elif 'Consequence' in annotations.columns:
+            func_mask = annotations['Consequence'].apply(
+                lambda x: any(c in functional_consequences for c in str(x).split(','))
+            )
+            filter_mask &= func_mask.values
+            logger.info(f"Functional filter: {func_mask.sum():,} coding/splice variants")
+        else:
+            logger.warning("No consequence column found - skipping functional filter")
+
+    # Apply filters
+    if filter_mask.sum() < original_count:
+        annotations = annotations[filter_mask].reset_index(drop=True)
+        delta_embeddings = delta_embeddings[filter_mask]
+        logger.info(f"After filtering: {len(annotations):,} variants (from {original_count:,})")
+
+        if len(annotations) == 0:
+            logger.error("No variants remaining after filtering!")
+            return
+
+    # ========== END VARIANT FILTERING ==========
 
     # Get positions and region types
     positions = annotations['POS'].values if 'POS' in annotations.columns else np.arange(len(annotations))
@@ -1458,8 +1619,14 @@ def main():
 
     # Model configuration
     parser.add_argument('--model-type', default='hierarchical',
-                       choices=['hierarchical', 'baseline'],
-                       help='Model type (default: hierarchical)')
+                       choices=['hierarchical', 'baseline', 'prs'],
+                       help='Model type: hierarchical (uses embeddings), baseline (mean pooling), prs (dosages only, no embeddings)')
+
+    # Variant filtering (for rare variant analysis)
+    parser.add_argument('--max-maf', type=float, default=None,
+                       help='Maximum MAF for rare variant analysis (e.g., 0.01 for <1%%, 0.05 for <5%%)')
+    parser.add_argument('--functional-only', action='store_true',
+                       help='Only use functional variants (missense, splice, frameshift, stop gained/lost)')
 
     # Training parameters
     parser.add_argument('--n-folds', type=int, default=5,
