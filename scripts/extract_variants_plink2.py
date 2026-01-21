@@ -265,8 +265,12 @@ def convert_bed(args):
             zarr_path = None
 
         # Decode table: 2-bit encoding -> dosage (count of A1 allele)
-        # 00 -> 2 (hom A1), 01 -> 1 (het), 10 -> NaN (missing), 11 -> 0 (hom A2)
-        decode_table = np.array([2, 1, np.nan, 0], dtype=np.float32)
+        # PLINK BED format specification:
+        # 00 (index 0) -> 2 (homozygous first/A1 allele)
+        # 01 (index 1) -> NaN (missing genotype)
+        # 10 (index 2) -> 1 (heterozygous)
+        # 11 (index 3) -> 0 (homozygous second/A2 allele)
+        decode_table = np.array([2, np.nan, 1, 0], dtype=np.float32)
 
         # Process in batches of variants for efficiency
         BATCH_SIZE = 10000
