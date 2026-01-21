@@ -1001,6 +1001,18 @@ def train_model(args):
 
     logger.info(f"Delta embeddings shape: {delta_embeddings.shape}")
 
+    # Check embedding statistics and normalize if needed
+    emb_mean = delta_embeddings.mean()
+    emb_std = delta_embeddings.std()
+    logger.info(f"Delta embeddings stats: mean={emb_mean:.6f}, std={emb_std:.6f}")
+
+    if emb_std < 0.01:
+        logger.warning(f"Delta embeddings have very small std ({emb_std:.6f}), normalizing...")
+        # Z-score normalization: (x - mean) / std
+        # This scales embeddings to have mean=0, std=1
+        delta_embeddings = (delta_embeddings - emb_mean) / (emb_std + 1e-8)
+        logger.info(f"After normalization: mean={delta_embeddings.mean():.6f}, std={delta_embeddings.std():.6f}")
+
     # Load annotations
     logger.info(f"Loading annotations from {args.annotations}")
     annotations = pd.read_parquet(args.annotations)
