@@ -154,7 +154,8 @@ def generate_embeddings_batch(
     sequences: List[str],
     max_length: int,
     device: str,
-    pooling: str = 'mean'
+    pooling: str = 'mean',
+    variant_window: int = 50
 ) -> np.ndarray:
     """
     Generate embeddings for a batch of sequences.
@@ -165,7 +166,8 @@ def generate_embeddings_batch(
         sequences: List of DNA sequences
         max_length: Maximum sequence length
         device: Device to use
-        pooling: 'mean', 'cls', or 'last'
+        pooling: 'mean', 'cls', 'last', or 'variant'
+        variant_window: Window size (±tokens) around variant for 'variant' pooling
 
     Returns:
         Array of embeddings (batch_size, embedding_dim)
@@ -202,6 +204,19 @@ def generate_embeddings_batch(
     elif pooling == 'last':
         # Use last token
         embeddings = hidden_states[:, -1, :]
+    elif pooling == 'variant':
+        # Extract embedding around the variant position (center of sequence)
+        # The variant is at the center because construct_sequences.py centers the variant
+        seq_len = hidden_states.shape[1]
+        center = seq_len // 2
+
+        # Define window bounds, clamped to valid range
+        window_start = max(0, center - variant_window)
+        window_end = min(seq_len, center + variant_window + 1)
+
+        # Mean pool within the local window around the variant
+        local_hidden = hidden_states[:, window_start:window_end, :]
+        embeddings = local_hidden.mean(dim=1)
     else:
         raise ValueError(f"Unknown pooling: {pooling}")
 
@@ -279,6 +294,8 @@ def generate_embeddings(args):
     logger.info(f"Generating embeddings in {n_batches} batches of {batch_size}...")
     logger.info(f"Max sequence length: {max_length}")
     logger.info(f"Pooling strategy: {args.pooling}")
+    if args.pooling == 'variant':
+        logger.info(f"Variant window: ±{args.variant_window} tokens ({args.variant_window * 2 + 1} total)")
 
     valid_indices = df.index[valid_mask].tolist()
 
@@ -293,11 +310,12 @@ def generate_embeddings(args):
 
         # Generate embeddings
         try:
+            variant_window = getattr(args, 'variant_window', 50)
             ref_emb = generate_embeddings_batch(
-                model, tokenizer, ref_seqs, max_length, device, args.pooling
+                model, tokenizer, ref_seqs, max_length, device, args.pooling, variant_window
             )
             alt_emb = generate_embeddings_batch(
-                model, tokenizer, alt_seqs, max_length, device, args.pooling
+                model, tokenizer, alt_seqs, max_length, device, args.pooling, variant_window
             )
 
             # Store embeddings
@@ -401,8 +419,13 @@ def main():
     )
     parser.add_argument(
         '--pooling', default='mean',
-        choices=['mean', 'cls', 'last'],
-        help='Pooling strategy for sequence embedding (default: mean)'
+        choices=['mean', 'cls', 'last', 'variant'],
+        help='Pooling strategy for sequence embedding. "variant" pools only around '
+             'the variant position to maximize delta signal (default: mean)'
+    )
+    parser.add_argument(
+        '--variant-window', type=int, default=50,
+        help='Window size (±tokens) around variant for "variant" pooling (default: 50)'
     )
     parser.add_argument(
         '--fp16', action='store_true',
