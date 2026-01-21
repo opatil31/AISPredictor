@@ -132,8 +132,7 @@ def train_xgboost_cv(
             'reg_lambda': 1.0,
             'random_state': 42,
             'n_jobs': -1,
-            'eval_metric': 'auc',
-            'use_label_encoder': False
+            'eval_metric': 'auc'
         }
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
@@ -597,7 +596,6 @@ def main():
         'reg_lambda': 1.0,
         'random_state': 42,
         'n_jobs': -1,
-        'use_label_encoder': False,
         'eval_metric': 'auc'
     }
 
