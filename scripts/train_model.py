@@ -1224,21 +1224,56 @@ def train_model(args):
             # Create mapping from dosage variant ID to column index
             dosage_id_to_idx = {vid: idx for idx, vid in enumerate(variant_ids_dosage)}
 
+            # Also create mapping with swapped alleles (REF/ALT vs A1/A2 order may differ)
+            # and position-only mapping as fallback
+            dosage_id_swapped = {}
+            dosage_pos_to_idx = {}
+            for idx, vid in enumerate(variant_ids_dosage):
+                parts = vid.split(':')
+                if len(parts) >= 4:
+                    # Create swapped version: chr:pos:alt:ref -> chr:pos:ref:alt
+                    swapped = f"{parts[0]}:{parts[1]}:{parts[3]}:{parts[2]}"
+                    dosage_id_swapped[swapped] = idx
+                    # Position-only key
+                    pos_key = f"{parts[0]}:{parts[1]}"
+                    if pos_key not in dosage_pos_to_idx:
+                        dosage_pos_to_idx[pos_key] = idx
+
             # Find matching indices
             matched_variant_indices = []
             unmatched_count = 0
+            match_by_swap = 0
+            match_by_pos = 0
             for ann_id in annotation_variant_ids:
                 if ann_id in dosage_id_to_idx:
                     matched_variant_indices.append(dosage_id_to_idx[ann_id])
+                elif ann_id in dosage_id_swapped:
+                    # Match with swapped alleles
+                    matched_variant_indices.append(dosage_id_swapped[ann_id])
+                    match_by_swap += 1
                 else:
                     # Try alternative formats (with/without chr prefix)
                     alt_id = ann_id.replace('chr', '') if ann_id.startswith('chr') else f"chr{ann_id}"
                     if alt_id in dosage_id_to_idx:
                         matched_variant_indices.append(dosage_id_to_idx[alt_id])
+                    elif alt_id in dosage_id_swapped:
+                        matched_variant_indices.append(dosage_id_swapped[alt_id])
+                        match_by_swap += 1
                     else:
-                        matched_variant_indices.append(-1)  # Mark as unmatched
-                        unmatched_count += 1
+                        # Try position-only match as last resort
+                        parts = ann_id.split(':')
+                        pos_key = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else None
+                        if pos_key and pos_key in dosage_pos_to_idx:
+                            matched_variant_indices.append(dosage_pos_to_idx[pos_key])
+                            match_by_pos += 1
+                        else:
+                            matched_variant_indices.append(-1)  # Mark as unmatched
+                            unmatched_count += 1
 
+            if match_by_swap > 0:
+                logger.info(f"Matched {match_by_swap} variants by swapped allele order (REF/ALT vs A1/A2)")
+            if match_by_pos > 0:
+                logger.info(f"Matched {match_by_pos} variants by position only")
             if unmatched_count > 0:
                 logger.warning(f"{unmatched_count} variants in annotations not found in dosage matrix")
 
